@@ -67,6 +67,11 @@ export default {
       const raw = await env.SEEN.get(HEALTH_KEY)
       return json(raw ? JSON.parse(raw) : { note: 'no health record yet' })
     }
+    // Diagnostics: send a test message and return Telegram's exact response
+    if (url.pathname === '/api/test-telegram' && request.method === 'POST') {
+      if (!authorized(request, env)) return json({ error: 'unauthorized' }, 401)
+      return json(await sendTelegram(env, '🔧 JobFlow 測試 — Worker → Telegram 通了！'))
+    }
     return new Response('JobFlow Worker is running!', { headers: CORS })
   },
 
@@ -493,22 +498,31 @@ async function runBackfill(env) {
 
 // ═══════════════ Telegram ═══════════════
 
+// Returns a result object so callers (and /api/test-telegram) can see what happened
 async function sendTelegram(env, text) {
-  if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) return
+  if (!env.TG_BOT_TOKEN || !env.TG_CHAT_ID) {
+    return { ok: false, error: 'TG_BOT_TOKEN or TG_CHAT_ID is not set' }
+  }
   try {
-    const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN.trim()}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        chat_id: env.TG_CHAT_ID,
+        chat_id: env.TG_CHAT_ID.trim(),
         text,
         parse_mode: 'HTML',
         disable_web_page_preview: true,
       }),
     })
-    if (!res.ok) console.error(`Telegram ${res.status}: ${await res.text()}`)
+    const body = await res.text()
+    if (!res.ok) {
+      console.error(`Telegram ${res.status}: ${body}`)
+      return { ok: false, status: res.status, telegramSays: body }
+    }
+    return { ok: true }
   } catch (e) {
     console.error('Telegram error: ' + (e && e.message))
+    return { ok: false, error: String(e && e.message) }
   }
 }
 

@@ -176,13 +176,14 @@ function init() {
     return
   }
 
-  // Detection failed: on known job pages, still inject the sidebar (manual mode)
+  // Detection failed: on known job pages or ANY whitelisted ATS host,
+  // still inject the sidebar (manual mode) — application form pages often
+  // have no JD text, but the user still wants autofill + cover letter
   const url = window.location.href
   const isJobPage =
+    isAtsHost() ||
     url.includes('linkedin.com/jobs/view') ||
     url.includes('linkedin.com/jobs/collections') ||
-    url.includes('greenhouse.io/jobs') ||
-    url.includes('lever.co') ||
     url.includes('indeed.com/viewjob')
 
   if (isJobPage) {

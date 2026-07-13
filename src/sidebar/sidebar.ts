@@ -1,3 +1,4 @@
+import { jsPDF } from 'jspdf'
 import type { JobInfo } from '../shared/types'
 
 let currentJob: JobInfo | null = null
@@ -101,6 +102,34 @@ document.getElementById('copyCoverBtn')!.addEventListener('click', async () => {
 // Discard
 document.getElementById('discardBtn')!.addEventListener('click', () => {
   window.parent.postMessage({ type: 'SIDEBAR_CLOSE' }, '*')
+})
+
+// Download the cover letter as a PDF (for forms that require a file upload)
+document.getElementById('downloadCoverBtn')!.addEventListener('click', () => {
+  const text = (document.getElementById('coverLetterEditor') as HTMLTextAreaElement).value
+  if (!text.trim()) return
+
+  const doc = new jsPDF({ unit: 'pt', format: 'letter' })
+  const margin = 72                                              // 1-inch margins
+  const width = doc.internal.pageSize.getWidth() - margin * 2
+  const bottom = doc.internal.pageSize.getHeight() - margin
+  doc.setFont('times', 'normal')
+  doc.setFontSize(11)
+
+  let y = margin
+  for (const line of doc.splitTextToSize(text, width) as string[]) {
+    if (y > bottom) { doc.addPage(); y = margin }
+    doc.text(line, margin, y)
+    y += 16
+  }
+
+  const company = (document.getElementById('jobCompany')?.textContent ?? '')
+    .split('·')[0].trim().replace(/[^\w-]+/g, '_')
+  doc.save(`Cover_Letter${company ? '_' + company : ''}.pdf`)
+
+  const btn = document.getElementById('downloadCoverBtn')!
+  btn.textContent = '✓'
+  setTimeout(() => btn.textContent = '⬇', 1500)
 })
 
 // Start in idle state
