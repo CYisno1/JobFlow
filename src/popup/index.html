@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Resume Helper</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Resume Helper</h1>
+
+    <!-- Tabs -->
+    <div class="tabs">
+      <button class="tab active" data-tab="profile">個人資料</button>
+      <button class="tab" data-tab="history">投遞紀錄</button>
+    </div>
+
+    <!-- Profile tab -->
+    <div id="tab-profile" class="tab-content active">
+      <div class="form-group">
+        <label>姓名</label>
+        <input type="text" id="name" placeholder="王小明" />
+      </div>
+      <div class="form-group">
+        <label>Email</label>
+        <input type="email" id="email" placeholder="your@email.com" />
+      </div>
+      <div class="form-group">
+        <label>電話</label>
+        <input type="text" id="phone" placeholder="0912-345-678" />
+      </div>
+      <div class="form-group">
+        <label>所在地</label>
+        <input type="text" id="location" placeholder="台北市" />
+      </div>
+      <div class="form-group">
+        <label>LinkedIn URL</label>
+        <input type="url" id="linkedinUrl" placeholder="https://linkedin.com/in/yourname" />
+      </div>
+      <div class="form-group">
+        <label>GitHub URL</label>
+        <input type="url" id="githubUrl" placeholder="https://github.com/yourname" />
+        <div class="hint">也會自動填入「Other website / Portfolio」類欄位</div>
+      </div>
+
+      <div class="form-group">
+        <label>基本履歷 <span class="label-hint">（上傳後會自動填入姓名、Email 等欄位）</span></label>
+        <!-- label[for] binds the input directly — no JS click() needed -->
+        <label for="resumeFile" class="upload-area" id="uploadArea">
+          <div class="upload-icon">📄</div>
+          <div class="upload-text">點擊或拖曳 PDF 上傳</div>
+          <div class="upload-hint">上傳後文字會自動擷取</div>
+        </label>
+        <input type="file" id="resumeFile" accept=".pdf" class="sr-only" />
+        <div id="uploadStatus" class="upload-status hidden"></div>
+        <textarea id="baseResumeText" placeholder="或直接在這裡貼上履歷文字..." rows="6"></textarea>
+      </div>
+
+      <div class="form-group">
+        <div class="section-header">
+          <label>成績單 <span class="label-hint">選填</span></label>
+          <span class="section-desc">投遞時自動偵測表單是否要求，有需要才會附上</span>
+        </div>
+        <label for="transcriptFile" class="upload-area" id="transcriptUploadArea">
+          <div class="upload-icon">📊</div>
+          <div class="upload-text">點擊或拖曳成績單 PDF 上傳</div>
+          <div class="upload-hint">自動擷取最新學期 GPA</div>
+        </label>
+        <input type="file" id="transcriptFile" accept=".pdf" class="sr-only" />
+        <div id="transcriptUploadStatus" class="upload-status hidden"></div>
+        <div class="gpa-row">
+          <div class="form-group-inline">
+            <label>最新學期 GPA</label>
+            <input type="text" id="transcriptGpa" placeholder="3.85 / 4.0" />
+          </div>
+          <div class="form-group-inline">
+            <label>學期</label>
+            <input type="text" id="transcriptSemester" placeholder="Fall 2024" />
+          </div>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>Worker 網址</label>
+        <input type="text" id="workerUrl" placeholder="https://jobflow-worker.你的帳號.workers.dev" />
+      </div>
+
+      <div class="form-group">
+        <label>Worker Token</label>
+        <input type="password" id="workerToken" placeholder="呼叫 Worker 用的通行證" />
+        <div class="hint">要和 Worker 上設定的 WORKER_TOKEN 一致</div>
+      </div>
+
+      <div class="form-group">
+        <label>Apps Script Webhook 網址</label>
+        <input type="text" id="sheetsId" placeholder="https://script.google.com/macros/s/.../exec" />
+        <div class="hint">Apps Script「部署」後拿到的網址（結尾是 /exec），用來讀寫 Google Sheet</div>
+      </div>
+
+      <button id="saveProfile" class="btn-primary">儲存設定</button>
+      <div id="saveStatus" class="save-status hidden"></div>
+    </div>
+
+    <!-- History tab -->
+    <div id="tab-history" class="tab-content">
+      <!-- Funnel stats (from Google Sheet) -->
+      <div id="funnelStats" class="funnel-stats hidden"></div>
+      <!-- Latest jobs from the Sheet -->
+      <div class="section-label">最新職缺（來自 Google Sheet）</div>
+      <div id="sheetJobsList"><div class="empty-state">載入中…</div></div>
+      <div class="section-divider"></div>
+      <!-- Local application history -->
+      <div class="section-label">本機投遞紀錄</div>
+      <div id="historyList">
+        <div class="empty-state">還沒有投遞紀錄</div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="popup.ts"></script>
+</body>
+</html>

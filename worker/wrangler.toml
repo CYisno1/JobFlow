@@ -1,0 +1,16 @@
+# Worker deployment config, read by wrangler.
+name = "jobflow-worker"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+# Cron: crawl every 30 minutes
+[triggers]
+crons = ["*/30 * * * *"]
+
+# KV binding: env.SEEN in code maps to this namespace
+[[kv_namespaces]]
+binding = "SEEN"
+id = "b2ee910b766a4303bc57b46e540232e8"
+
+# Secrets are NOT stored here (this file is committed to git).
+# Set them with: npx wrangler secret put <NAME>   — see README.md for the list.

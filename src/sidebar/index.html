@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <title>Resume Helper</title>
+  <link rel="stylesheet" href="sidebar.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Collapsed state: only this tab shows -->
+    <div id="collapsedTab" class="collapsed-tab hidden">
+      <button id="expandBtn" class="expand-btn" title="展開">◀</button>
+    </div>
+
+    <div id="mainContent">
+    <div class="header">
+      <div class="header-left">
+        <span class="logo">Resume Helper</span>
+        <span id="sourceBadge" class="source-badge"></span>
+      </div>
+      <div class="header-right">
+        <button id="minimizeBtn" class="close-btn" title="最小化">−</button>
+        <button id="closeBtn" class="close-btn" title="關閉">✕</button>
+      </div>
+    </div>
+
+    <div id="jobInfo" class="job-info hidden">
+      <div id="jobTitle" class="job-title"></div>
+      <div id="jobCompany" class="job-company"></div>
+    </div>
+
+    <!-- State: error -->
+    <div id="stateError" class="state hidden">
+      <div class="state-icon">⚠️</div>
+      <div id="errorMsg" class="state-text error-text"></div>
+    </div>
+
+    <!-- Main actions -->
+    <div id="stateReady" class="state hidden">
+      <!-- Cover letter -->
+      <div id="coverLetterLoading" class="cover-letter-loading hidden">✦ 生成求職信中...</div>
+      <div id="coverLetterSection" class="hidden">
+        <div class="resume-toolbar">
+          <span class="toolbar-label">Cover Letter</span>
+          <button id="copyCoverBtn" class="btn-icon" title="複製">📋</button>
+        </div>
+        <textarea id="coverLetterEditor" class="resume-editor cover-letter-editor" spellcheck="false"></textarea>
+      </div>
+
+      <div class="action-bar">
+        <button id="fillFormBtn" class="btn-primary">自動填入表單</button>
+        <button id="uploadPdfBtn" class="btn-primary">⬆ Upload Resume</button>
+      </div>
+      <div class="action-bar" style="margin-top:6px">
+        <button id="coverLetterBtn" class="btn-secondary">Cover Letter</button>
+        <button id="discardBtn" class="btn-secondary">捨棄</button>
+      </div>
+    </div>
+
+    <!-- State: idle (waiting for detection) -->
+    <div id="stateIdle" class="state hidden">
+      <div class="state-icon">🔍</div>
+      <div class="state-text">請開啟一個職缺頁面</div>
+    </div>
+  </div>
+
+  </div><!-- end mainContent -->
+
+  <script type="module" src="sidebar.ts"></script>
+</body>
+</html>

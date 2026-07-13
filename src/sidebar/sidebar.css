@@ -1,0 +1,236 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 13px;
+  background: #ffffff;
+  color: #1a1a2e;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid #e5e7eb;
+  box-shadow: -4px 0 20px rgba(0,0,0,0.1);
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* Header */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid #e5e7eb;
+  background: #6366f1;
+  color: white;
+  flex-shrink: 0;
+}
+
+.header-left { display: flex; align-items: center; gap: 8px; }
+
+.logo { font-weight: 700; font-size: 14px; }
+
+.source-badge {
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(255,255,255,0.25);
+  padding: 2px 7px;
+  border-radius: 10px;
+  text-transform: uppercase;
+}
+
+.close-btn {
+  background: none;
+  border: none;
+  color: rgba(255,255,255,0.8);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: background 0.15s;
+}
+.close-btn:hover { background: rgba(255,255,255,0.2); color: white; }
+
+/* Job Info */
+.job-info {
+  padding: 10px 14px;
+  background: #f0f0ff;
+  border-bottom: 1px solid #e0e0ff;
+  flex-shrink: 0;
+}
+.job-title   { font-weight: 700; font-size: 14px; color: #1a1a2e; }
+.job-company { font-size: 12px; color: #6366f1; margin-top: 2px; }
+
+/* States */
+.state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  padding: 20px;
+  gap: 12px;
+  overflow: hidden;
+}
+
+.state.hidden { display: none !important; }
+
+.state-icon { font-size: 32px; }
+
+.state-text {
+  font-size: 13px;
+  color: #6b7280;
+  text-align: center;
+  line-height: 1.5;
+}
+
+.error-text { color: #ef4444; }
+
+/* Spinner */
+.spinner {
+  width: 32px; height: 32px;
+  border: 3px solid #e5e7eb;
+  border-top-color: #6366f1;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Streaming preview */
+.stream-preview {
+  width: 100%;
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 11px;
+  color: #6b7280;
+  background: #f8f9fa;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 8px;
+  white-space: pre-wrap;
+  font-family: monospace;
+  line-height: 1.4;
+}
+
+/* Ready state */
+#stateReady {
+  padding: 12px 14px;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 8px;
+}
+
+.resume-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.toolbar-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.btn-icon {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  opacity: 0.7;
+  transition: opacity 0.15s;
+}
+.btn-icon:hover { opacity: 1; }
+
+.resume-editor {
+  flex: 1;
+  min-height: 0;
+  resize: none;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  padding: 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  font-family: 'Courier New', monospace;
+  color: #1a1a2e;
+  background: white;
+  overflow-y: auto;
+}
+.resume-editor:focus { outline: none; border-color: #6366f1; }
+
+.cover-letter-editor { min-height: 160px; flex: none; }
+.cover-letter-loading { font-size: 12px; color: #818cf8; text-align: center; padding: 6px 0; }
+
+.action-bar {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.btn-primary {
+  flex: 1;
+  padding: 9px;
+  background: #6366f1;
+  color: white;
+  border: none;
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.btn-primary:hover { background: #4f46e5; }
+
+.btn-secondary {
+  padding: 9px 16px;
+  background: white;
+  color: #6b7280;
+  border: 1px solid #d1d5db;
+  border-radius: 7px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.btn-secondary:hover { border-color: #6366f1; color: #6366f1; }
+
+.hidden { display: none !important; }
+
+/* Collapsed tab */
+.collapsed-tab {
+  position: fixed;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.expand-btn {
+  background: #6366f1;
+  color: white;
+  border: none;
+  border-radius: 8px 0 0 8px;
+  width: 32px;
+  height: 64px;
+  font-size: 14px;
+  cursor: pointer;
+  box-shadow: -3px 0 12px rgba(0,0,0,0.2);
+  transition: background 0.15s;
+}
+.expand-btn:hover { background: #4f46e5; }
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
