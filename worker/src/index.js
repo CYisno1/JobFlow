@@ -18,7 +18,7 @@
 
 const MODEL = 'claude-sonnet-4-6'                  // resume/cover letter generation
 const SCORE_MODEL = 'claude-haiku-4-5-20251001'    // job scoring (cheap + fast)
-const SCORE_THRESHOLD = 70                         // notify only at or above this score
+const SCORE_THRESHOLD = 60                         // notify at or above this score (lowered from 70: prefer noise over misses)
 const SCORE_MAX_PER_RUN = 25                       // cost cap per crawl cycle
 
 const SIMPLIFY_REPO   = 'SimplifyJobs/New-Grad-Positions'
@@ -126,6 +126,18 @@ async function sbInsert(env, table, rows, ignoreDup = true) {
     body: JSON.stringify(rows),
   })
   if (!res.ok) console.error(`Supabase insert ${table} ${res.status}: ${await res.text()}`)
+}
+
+// Batch upsert: update existing rows (merge) or insert missing — ONE request for N rows.
+// Free plan allows 50 subrequests per invocation; per-row requests caused a crash loop.
+async function sbUpsert(env, table, rows) {
+  if (!sbReady(env) || rows.length === 0) return
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}?on_conflict=id`, {
+    method: 'POST',
+    headers: sbHeaders(env, { 'Prefer': 'resolution=merge-duplicates' }),
+    body: JSON.stringify(rows),
+  })
+  if (!res.ok) console.error(`Supabase upsert ${table} ${res.status}: ${await res.text()}`)
 }
 
 // Conditional update; filter uses PostgREST syntax, e.g. id=eq.xxx
@@ -381,8 +393,11 @@ export async function runCrawler(env) {
     locations: j.location, salary: j.salary, source: j.source,
     category: j.category, sponsorship: j.sponsorship, active: true,
   })))
-  for (const id of closedIds) {
-    await sbPatch(env, 'jobs', `id=eq.${encodeURIComponent(id)}`, { active: false })
+  // Mark closures in batches of 30 ids per request (was one PATCH per id —
+  // blew the 50-subrequest limit when closures piled up)
+  for (let i = 0; i < closedIds.length; i += 30) {
+    const list = closedIds.slice(i, i + 30).map(id => `"${id}"`).join(',')
+    await sbPatch(env, 'jobs', `id=in.(${encodeURIComponent(list)})`, { active: false })
   }
 
   // Transitional dual-write to the Sheet ledger
@@ -396,17 +411,22 @@ export async function runCrawler(env) {
     } catch (e) { console.error('Sheet write error: ' + (e && e.message)) }
   }
 
-  // Score new jobs (capped per run to bound cost)
+  // Score new jobs (capped per run to bound cost), then write all scores
+  // back in ONE request (was one PATCH per job)
+  const scoredRows = []
   for (const job of newJobs.slice(0, SCORE_MAX_PER_RUN)) {
     const r = await scoreJob(env, job)
     if (r) {
       job.score = r.score
       job.reason = r.reason
       log.scored++
-      await sbPatch(env, 'jobs', `id=eq.${encodeURIComponent(job.id)}`,
-        { score: r.score, score_reason: r.reason })
+      scoredRows.push({
+        id: job.id, company: job.company, title: job.title, url: job.url,
+        score: r.score, score_reason: r.reason,
+      })
     }
   }
+  await sbUpsert(env, 'jobs', scoredRows)
 
   // Notify: high scores, plus unscored ones (if scoring breaks, degrade to noisy — never silent)
   const toNotify = newJobs.filter(j => j.score == null || j.score >= SCORE_THRESHOLD)
