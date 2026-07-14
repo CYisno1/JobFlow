@@ -72,6 +72,11 @@ export default {
       if (!authorized(request, env)) return json({ error: 'unauthorized' }, 401)
       return json(await sendTelegram(env, '🔧 JobFlow 測試 — Worker → Telegram 通了！'))
     }
+    // Popup dashboard: funnel stats + top open, un-applied jobs (reads Supabase)
+    if (url.pathname === '/api/summary' && request.method === 'GET') {
+      if (!authorized(request, env)) return json({ error: 'unauthorized' }, 401)
+      return json(await buildSummary(env))
+    }
     return new Response('JobFlow Worker is running!', { headers: CORS })
   },
 
@@ -451,6 +456,53 @@ export async function runCrawler(env) {
   await updateHealth(env, log)
   console.log(JSON.stringify(log))
   return log
+}
+
+// ═══════════════ Popup summary ═══════════════
+// One call returns everything the popup dashboard needs.
+// The service key never leaves the Worker — the popup only holds the bearer token.
+
+async function buildSummary(env) {
+  if (!sbReady(env)) return { ok: false, error: 'Supabase not configured' }
+
+  // Row counts via HEAD + Prefer: count=exact (content-range: "0-N/total")
+  const count = async (table, filter = '') => {
+    const res = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/${table}?select=id${filter ? '&' + filter : ''}`,
+      { method: 'HEAD', headers: sbHeaders(env, { 'Prefer': 'count=exact' }) })
+    const range = res.headers.get('content-range') || ''
+    return parseInt(range.split('/')[1], 10) || 0
+  }
+
+  const [jobsTotal, jobsOpen] = await Promise.all([
+    count('jobs'), count('jobs', 'active=eq.true'),
+  ])
+
+  const apps = await sbSelect(env, 'applications',
+    'select=url,status&order=applied_at.desc&limit=1000')
+  const appliedUrls = new Set(apps.map(a => a.url))
+  const byStatus = {}
+  for (const a of apps) {
+    const s = a.status || 'applied'
+    byStatus[s] = (byStatus[s] || 0) + 1
+  }
+
+  // Top open jobs by score; exclude already-applied (filtered here — PostgREST has no subqueries)
+  const rows = await sbSelect(env, 'jobs',
+    'select=company,title,url,locations,salary,score,source,created_at' +
+    '&active=eq.true&order=score.desc.nullslast,created_at.desc&limit=40')
+  const jobs = (rows || []).filter(j => !appliedUrls.has(j.url)).slice(0, 15).map(j => ({
+    date: (j.created_at || '').slice(0, 10),
+    company: j.company, title: j.title, location: j.locations || '',
+    salary: j.salary || '', source: j.source || '', url: j.url, score: j.score,
+  }))
+
+  return {
+    ok: true,
+    stats: { jobsTotal, jobsOpen, applied: apps.length, byStatus },
+    jobs,
+    updatedAt: new Date().toISOString(),
+  }
 }
 
 // ═══════════════ Health monitoring ═══════════════

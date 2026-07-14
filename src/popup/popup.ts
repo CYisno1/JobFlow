@@ -428,21 +428,22 @@ document.getElementById('saveProfile')!.addEventListener('click', async () => {
 // Note: alert settings, manual scan and the local queue were removed 2026-07-12 —
 // crawling and notifications live in the Cloudflare Worker; the popup only reads ledgers.
 
-// ── Google Sheet stats + latest jobs ──────────────────────
-// Calls Apps Script doGet(?action=summary) for totals, open count,
-// application stats, and the latest 15 un-applied jobs
+// ── Dashboard: funnel stats + top open jobs (from Supabase via Worker) ──
 async function loadSheetSummary() {
   const container = document.getElementById('sheetJobsList')!
   const statsEl   = document.getElementById('funnelStats')!
 
   const profile = await getProfile()
-  if (!profile?.sheetsId || !profile.sheetsId.startsWith('http')) {
-    container.innerHTML = '<div class="empty-state">請先在「個人資料」填入 Apps Script Webhook 網址</div>'
+  if (!profile?.workerUrl || !profile?.workerToken) {
+    container.innerHTML = '<div class="empty-state">請先在「個人資料」填入 Worker 網址和 Token</div>'
     return
   }
 
   try {
-    const res = await fetch(`${profile.sheetsId}${profile.sheetsId.includes('?') ? '&' : '?'}action=summary`)
+    const base = profile.workerUrl.trim().replace(/\/+$/, '')
+    const res = await fetch(`${base}/api/summary`, {
+      headers: { 'Authorization': `Bearer ${profile.workerToken.trim()}` },
+    })
     const data = await res.json()
     if (!data.ok) throw new Error('bad response')
 
@@ -459,15 +460,15 @@ async function loadSheetSummary() {
     `
     statsEl.classList.remove('hidden')
 
-    // Latest jobs list
-    const jobs = data.jobs as Array<{ date: string; company: string; title: string; location: string; salary: string; source: string; url: string }>
+    // Top open, un-applied jobs (sorted by AI score)
+    const jobs = data.jobs as Array<{ date: string; company: string; title: string; location: string; salary: string; source: string; url: string; score: number | null }>
     if (jobs.length === 0) {
-      container.innerHTML = '<div class="empty-state">Sheet 裡還沒有職缺，等爬蟲跑一輪吧</div>'
+      container.innerHTML = '<div class="empty-state">資料庫裡還沒有職缺，等爬蟲跑一輪吧</div>'
       return
     }
     container.innerHTML = jobs.map(j => `
       <div class="history-item sheet-job" data-url="${escapeHtml(j.url)}">
-        <div class="history-company">${escapeHtml(j.company)}${j.salary ? ` <span class="job-salary">${escapeHtml(j.salary)}</span>` : ''}</div>
+        <div class="history-company">${j.score != null ? `<span class="job-salary">${j.score}分</span> ` : ''}${escapeHtml(j.company)}${j.salary ? ` <span class="job-salary">${escapeHtml(j.salary)}</span>` : ''}</div>
         <div class="history-title">${escapeHtml(j.title)}</div>
         <div class="history-meta">
           <span>${escapeHtml(j.location || '')}</span>
@@ -483,7 +484,7 @@ async function loadSheetSummary() {
       })
     })
   } catch {
-    container.innerHTML = '<div class="empty-state">讀取失敗——確認 Apps Script 已部署、網址填的是 /exec 結尾</div>'
+    container.innerHTML = '<div class="empty-state">讀取失敗——確認 Worker 網址/Token 正確、Worker 已部署最新版</div>'
   }
 }
 
