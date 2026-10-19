@@ -56,7 +56,6 @@
         "https://*.greenhouse.io/*",
         "https://boards.greenhouse.io/*",
         "https://*.lever.co/*",
-        "https://*.myworkdayjobs.com/*",
         "https://*.applytojob.com/*",
         "https://*.ashbyhq.com/*",
         "https://*.oraclecloud.com/*",
@@ -69,6 +68,9 @@
         "https://github.com/SimplifyJobs/*",
         "https://github.com/*/jobs*",
         "https://github.com/*/internships*"
+      ],
+      "exclude_matches": [
+        "https://*.myworkdayjobs.com/*"
       ],
       "js": ["src/content/index.ts"],
       "run_at": "document_idle"

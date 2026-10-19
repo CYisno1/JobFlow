@@ -2,14 +2,16 @@ import { getProfile, getResumePdf } from '../shared/storage'
 import type { UserProfile } from '../shared/types'
 
 // ── ATS platform detection ────────────────────────────────
-export type AtsType = 'greenhouse' | 'lever' | 'workday' | 'jazzhr' | 'oracle' | 'ashby' | null
+// Workday is deliberately absent: the content script never runs there (see
+// manifest exclude_matches). Workday autofill is user-triggered via the popup
+// and lives in workday-fill.ts.
+export type AtsType = 'greenhouse' | 'lever' | 'jazzhr' | 'oracle' | 'ashby' | null
 
 export function detectAts(): AtsType {
   const host = window.location.hostname
   const path = window.location.pathname
   if (host.includes('greenhouse.io') && (path.includes('/jobs/') || path.includes('/apply'))) return 'greenhouse'
   if (host.includes('lever.co') && path.includes('/apply')) return 'lever'
-  if (host.includes('myworkdayjobs.com')) return 'workday'
   if (host.includes('applytojob.com')) return 'jazzhr'
   if (host.includes('oraclecloud.com') && path.includes('/apply')) return 'oracle'
   if (host.includes('ashbyhq.com') && (path.includes('/apply') || path.includes('/application'))) return 'ashby'
@@ -24,12 +26,6 @@ export async function tryAutoFill() {
   const profile = await getProfile()
   if (!profile?.name && !profile?.email) return
 
-  // Workday has its own flow (one-click Autofill with Resume + PDF injection)
-  if (ats === 'workday') {
-    await fillWorkdayFlow(profile)
-    return
-  }
-
   await waitForForm(ats)
 
   const filled: string[] = []
@@ -40,48 +36,6 @@ export async function tryAutoFill() {
   if (ats === 'ashby')      filled.push(...fillAshby(profile))
 
   if (filled.length > 0) showBanner(`已自動填入：${filled.join('、')}`)
-}
-
-// ── Workday one-click flow ────────────────────────────────
-// Prefer the "Autofill with Resume" button: click → inject PDF, Workday parses it.
-// Field-by-field filling is the fallback.
-async function fillWorkdayFlow(profile: UserProfile) {
-  await new Promise<void>(resolve => {
-    const check = () => {
-      if (findWorkdayAutofillButton() || document.querySelector('[data-automation-id="email"]')) {
-        resolve()
-        return
-      }
-      setTimeout(check, 500)
-    }
-    setTimeout(check, 500)
-    setTimeout(resolve, 10_000)   // wait at most 10s
-  })
-
-  const btn = findWorkdayAutofillButton()
-  if (btn) {
-    btn.click()
-    showBanner('正在上傳履歷到 Workday...')
-    const pdf = await getResumePdf()
-    if (pdf) {
-      const input = await waitForFileInput()
-      if (input) {
-        injectPdf(input, pdf)
-        showBanner('已上傳履歷，Workday 正在解析，請稍候...')
-        return
-      }
-    }
-    showBanner('請手動選擇 PDF 履歷檔案')
-  } else {
-    await waitForForm('workday')
-    const filled = fillWorkday(profile)
-    if (filled.length > 0) showBanner(`已自動填入：${filled.join('、')}`)
-  }
-}
-
-function findWorkdayAutofillButton(): HTMLElement | undefined {
-  return Array.from(document.querySelectorAll<HTMLElement>('button, [role="button"]'))
-    .find(el => /autofill with resume/i.test(el.textContent ?? ''))
 }
 
 // ── PDF injection: stored base64 resume → File → file input ──
@@ -220,28 +174,6 @@ function fillJazzHR(p: UserProfile): string[] {
 
   const linkedin = document.querySelector<HTMLInputElement>('input[name*="linkedin" i], input[placeholder*="linkedin" i]')
   if (linkedin && p.linkedinUrl) { linkedin.value = p.linkedinUrl; triggerInput(linkedin); filled.push('LinkedIn') }
-
-  filled.push(...fillUrlFields(p))
-
-  return filled
-}
-
-// ── Workday (field-by-field fallback) ─────────────────────
-function fillWorkday(p: UserProfile): string[] {
-  const filled: string[] = []
-
-  const fill = (selector: string, value: string, label: string) => {
-    const el = document.querySelector<HTMLInputElement>(selector)
-    if (el && value) { el.value = value; triggerInput(el); filled.push(label) }
-  }
-
-  fill('[data-automation-id="legalNameSection_firstName"]', p.name.split(' ')[0] ?? '', '名')
-  fill('[data-automation-id="legalNameSection_lastName"]',  p.name.split(' ').slice(1).join(' ') || p.name, '姓')
-  fill('[data-automation-id="email"]', p.email, 'Email')
-  fill('[data-automation-id="phone-number"]', p.phone, '電話')
-
-  // Some Workday pages lack data-automation-id; fall back to generic matching
-  if (!filled.includes('Email') && fillEmailFields(p)) filled.push('Email')
 
   filled.push(...fillUrlFields(p))
 
@@ -388,7 +320,6 @@ function waitForForm(ats: AtsType): Promise<void> {
   const selectors: Record<NonNullable<AtsType>, string> = {
     greenhouse: 'input[name="email"], input[type="email"]',
     lever:      'input[name="email"], input[type="email"]',
-    workday:    '[data-automation-id="email"], input[type="email"]',
     jazzhr:     'input[name="email"], input[type="email"]',
     oracle:     'input[type="email"], input[id*="email" i]',
     ashby:      'input[type="email"], input[name*="email" i]',

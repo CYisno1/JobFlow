@@ -103,7 +103,8 @@ window.addEventListener('message', (event) => {
 // Every ATS shows a fixed confirmation page after submitting: the URL contains
 // confirmation/thank-you, or the body says "Thank you for applying" etc.
 // On detection, notify the service worker to record the application.
-const ATS_HOSTS = ['greenhouse.io', 'lever.co', 'myworkdayjobs.com', 'applytojob.com', 'ashbyhq.com', 'oraclecloud.com']
+// Workday is excluded: this script never runs there (manifest exclude_matches)
+const ATS_HOSTS = ['greenhouse.io', 'lever.co', 'applytojob.com', 'ashbyhq.com', 'oraclecloud.com']
 const SUCCESS_TEXT_PATTERNS = [
   /thank you for applying/i,
   /thanks for applying/i,
@@ -164,7 +165,7 @@ if (isAtsHost()) {
 
 // ── Init ──────────────────────────────────────────────────
 function init() {
-  // ATS application pages: autofill (Workday uses its one-click flow)
+  // ATS application pages: autofill
   tryAutoFill()
   checkSubmitSuccess()
 
