@@ -292,10 +292,13 @@ export async function scoreJob(env, job) {
     return { error: 'RESUME_SUMMARY or ANTHROPIC_API_KEY is not set', kind: 'api' }
   }
 
-  const prompt = `You are screening job postings for a specific candidate. Score how well this job matches the candidate, 0-100.
+  // Only listing metadata is available (no full job description); the prompt
+  // says so, so the model does not invent requirements.
+  const prompt = `You are screening job postings for a candidate looking for early-career / new-grad full-time roles. Score how well this job matches the candidate, 0-100.
 
-Scoring guide: 90+ = near-perfect fit (right role type, right level, matching skills). 70-89 = strong fit, worth applying. 50-69 = partial fit. Below 50 = wrong direction.
-Consider: role type vs candidate's target roles, required skills overlap, new-grad friendliness, visa sponsorship if mentioned.
+Scoring guide: 90+ = near-perfect fit (one of the candidate's target role types, genuinely entry-level, matching skills). 70-89 = strong fit, worth applying. 50-69 = partial fit. Below 50 = wrong direction (unrelated role type, or clearly not entry-level).
+Consider, in order: role type vs the candidate's target roles; seniority (new-grad / entry-level / "I" titles fit; roles implying several years of experience do not); skills overlap; degree requirements; visa sponsorship if the candidate's background mentions it.
+Only the fields below are known about the job; do not assume requirements that are not stated.
 
 === CANDIDATE ===
 ${env.RESUME_SUMMARY}
@@ -303,8 +306,11 @@ ${env.RESUME_SUMMARY}
 === JOB ===
 Company: ${job.company}
 Title: ${job.title}
-Location: ${job.location || ''}
+Location: ${job.location || 'unknown'}
 Salary: ${job.salary || 'unknown'}
+Category: ${job.category || 'unknown'}
+Degrees: ${job.degrees || 'unknown'}
+Sponsorship: ${job.sponsorship || 'unknown'}
 
 Reply with ONLY this JSON, no other text:
 {"score": <int>, "reason": "<one short sentence>"}`
