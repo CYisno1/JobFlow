@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "node --test \"tests/*.test.ts\""
+    "test": "node --test \"tests/*.test.ts\" \"worker/test/*.test.js\""
   },
   "devDependencies": {
     "@crxjs/vite-plugin": "^2.0.0",
