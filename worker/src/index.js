@@ -5,6 +5,7 @@
  *   fetch()     — POST /api/generate     Claude API proxy (key never leaves server)
  *                 POST /api/application  record a submitted application
  *                 POST /api/crawl        trigger a crawl manually
+ *                 POST /api/test-telegram[?sample=1]  Telegram check / sample match
  *                 POST /api/backfill     one-time: load all open jobs into Supabase
  *                 GET  /api/status       health stats
  *   scheduled() — every 30 min: crawl → write Supabase + Sheet → queue new jobs
@@ -19,7 +20,8 @@
 
 const MODEL = 'claude-sonnet-4-6'                  // resume/cover letter generation
 const SCORE_MODEL = 'claude-haiku-4-5-20251001'    // job scoring (cheap + fast)
-const SCORE_THRESHOLD = 60                         // notify at or above this score
+// Defaults; override with [vars] in wrangler.toml (SCORE_THRESHOLD, SCORE_MAX_PER_RUN, NOTIFY_MAX_PER_RUN)
+const SCORE_THRESHOLD = 70                         // notify at or above this score
 const SCORE_MAX_PER_RUN = 20                       // cost cap per crawl cycle; the rest wait in the queue
 const NOTIFY_MAX_PER_RUN = 10                      // Telegram messages per cycle; the rest wait in the queue
 const PENDING_TTL_MS = 24 * 60 * 60 * 1000         // retry scoring / sending for at most 24h
@@ -48,8 +50,16 @@ const SEEN_KEY = 'seen-v1'       // KV: dedupe state (seen job ids/urls)
 const HEALTH_KEY = 'health-v1'   // KV: per-day run stats for the daily report
 const PENDING_KEY = 'pending-v1' // KV: new jobs waiting to be scored / sent
 
-function workerConfig() {
-  return { threshold: SCORE_THRESHOLD, scoreMax: SCORE_MAX_PER_RUN, notifyMax: NOTIFY_MAX_PER_RUN }
+export function workerConfig(env) {
+  const int = (v, def, min, max) => {
+    const n = parseInt(v, 10)
+    return isNaN(n) ? def : Math.min(max, Math.max(min, n))
+  }
+  return {
+    threshold: int(env.SCORE_THRESHOLD, SCORE_THRESHOLD, 0, 100),
+    scoreMax:  int(env.SCORE_MAX_PER_RUN, SCORE_MAX_PER_RUN, 0, 40),
+    notifyMax: int(env.NOTIFY_MAX_PER_RUN, NOTIFY_MAX_PER_RUN, 0, 20),
+  }
 }
 
 // ═══════════════ Entry points ═══════════════
@@ -76,11 +86,23 @@ export default {
     if (url.pathname === '/api/status' && request.method === 'GET') {
       if (!authorized(request, env)) return json({ error: 'unauthorized' }, 401)
       const raw = await env.SEEN.get(HEALTH_KEY)
-      return json(raw ? JSON.parse(raw) : { note: 'no health record yet' })
+      const pending = Object.values((await loadPending(env, Date.now())).jobs)
+      return json({
+        ...(raw ? JSON.parse(raw) : { note: 'no health record yet' }),
+        config: workerConfig(env),
+        queue: {
+          unscored: pending.filter(i => i.score == null).length,
+          awaitingTelegram: pending.filter(i => i.score != null).length,
+        },
+      })
     }
-    // Diagnostics: send a test message and return Telegram's exact response
+    // Diagnostics: send a test message and return Telegram's exact response.
+    // ?sample=1 sends a clearly-labelled fake match to check the format.
     if (url.pathname === '/api/test-telegram' && request.method === 'POST') {
       if (!authorized(request, env)) return json({ error: 'unauthorized' }, 401)
+      if (url.searchParams.get('sample')) {
+        return json(await sendTelegram(env, '🧪 TEST — sample only, not a real job\n\n' + formatMatch(SAMPLE_MATCH)))
+      }
       return json(await sendTelegram(env, '🔧 JobFlow 測試 — Worker → Telegram 通了！'))
     }
     // Popup dashboard: funnel stats + top open, un-applied jobs (reads Supabase)
@@ -447,6 +469,13 @@ async function notifyPending(env, pending, cfg, now, log) {
     pending.recent[key] = now
     log.notified++
   }
+}
+
+const SAMPLE_MATCH = {
+  score: 87, company: 'Example Company', title: 'Software Engineer I',
+  location: 'New York, NY', salary: '',
+  reason: 'Strong Python/backend alignment and suitable early-career level.',
+  url: 'https://example.com/jobs/123',
 }
 
 export function formatMatch(job) {

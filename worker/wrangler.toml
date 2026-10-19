@@ -7,6 +7,14 @@ compatibility_date = "2026-07-01"
 [triggers]
 crons = ["*/30 * * * *"]
 
+# Tunables (plain values, not secrets). Changing them needs a redeploy.
+[vars]
+SCORE_THRESHOLD = "70"      # send Telegram matches at or above this AI score (0-100)
+SCORE_MAX_PER_RUN = "20"    # jobs scored per 30-min run; the rest wait in the queue
+NOTIFY_MAX_PER_RUN = "10"   # Telegram messages per run; the rest wait in the queue
+# Free plan: 50 subrequests per run. Each score and each message is one;
+# keep SCORE_MAX_PER_RUN + NOTIFY_MAX_PER_RUN at or below ~38.
+
 # KV binding: env.SEEN in code maps to this namespace
 [[kv_namespaces]]
 binding = "SEEN"
