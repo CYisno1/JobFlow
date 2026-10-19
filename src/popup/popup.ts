@@ -1,6 +1,7 @@
 import * as pdfjsLib from 'pdfjs-dist'
-import { getProfile, saveProfile, getApplications, saveResumePdf } from '../shared/storage'
+import { getProfile, saveProfile, getApplications, saveResumePdf, getResumePdf } from '../shared/storage'
 import type { UserProfile } from '../shared/types'
+import { isWorkdayUrl, workdayAutofill, type WorkdayFillMode, type WorkdayFillResult } from '../content/workday-fill'
 
 // pdf.js worker from a local file (Chrome extension CSP)
 pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL('pdf.worker.min.js')
@@ -516,5 +517,55 @@ function escapeHtml(str: string): string {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
+// ── Workday: user-triggered autofill ──────────────────────
+// The content script never runs on Workday (it broke sign-in). Clicking a
+// button here injects workdayAutofill() into the active tab once.
+async function setupWorkdayPanel() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+  if (!tab?.id || !isWorkdayUrl(tab.url)) return
+  const tabId = tab.id
+
+  const panel     = document.getElementById('workdayPanel')!
+  const statusEl  = document.getElementById('workdayStatus')!
+  const fillBtn   = document.getElementById('workdayFillBtn') as HTMLButtonElement
+  const resumeBtn = document.getElementById('workdayResumeBtn') as HTMLButtonElement
+  panel.classList.remove('hidden')
+
+  const run = async (mode: WorkdayFillMode) => {
+    const profile = await getProfile()
+    if (!profile?.name && !profile?.email) {
+      showStatus(statusEl, '請先在下方「個人資料」儲存姓名和 Email', 'error')
+      return
+    }
+    fillBtn.disabled = resumeBtn.disabled = true
+    try {
+      const [injection] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: workdayAutofill,
+        args: [{
+          mode,
+          profile: {
+            name: profile.name ?? '', email: profile.email ?? '', phone: profile.phone ?? '',
+            linkedinUrl: profile.linkedinUrl ?? '', githubUrl: profile.githubUrl ?? '',
+          },
+          resumePdf: mode === 'resume' ? await getResumePdf() : null,
+        }],
+      })
+      const result = injection?.result as WorkdayFillResult | undefined
+      if (!result) throw new Error('no result')
+      const ok = result.status === 'filled' || result.status === 'uploaded'
+      showStatus(statusEl, result.message, ok ? 'success' : 'error')
+    } catch (err: any) {
+      showStatus(statusEl, `無法在這個頁面執行：${err?.message ?? err}`, 'error')
+    } finally {
+      fillBtn.disabled = resumeBtn.disabled = false
+    }
+  }
+
+  fillBtn.addEventListener('click', () => run('fields'))
+  resumeBtn.addEventListener('click', () => run('resume'))
+}
+
 // ── Init ──────────────────────────────────────────────────
 loadProfile()
+setupWorkdayPanel()
