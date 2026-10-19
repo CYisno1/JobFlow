@@ -7,7 +7,8 @@
  *                 POST /api/crawl        trigger a crawl manually
  *                 POST /api/backfill     one-time: load all open jobs into Supabase
  *                 GET  /api/status       health stats
- *   scheduled() — every 30 min: crawl → write Supabase + Sheet → score → notify
+ *   scheduled() — every 30 min: crawl → write Supabase + Sheet → queue new jobs
+ *                 (KV pending-v1) → score from the queue → notify scored matches
  *
  * Secrets (wrangler secret put): ANTHROPIC_API_KEY, WORKER_TOKEN,
  *   TG_BOT_TOKEN, TG_CHAT_ID, SHEET_WEBHOOK_URL, SUPABASE_URL,
@@ -18,8 +19,13 @@
 
 const MODEL = 'claude-sonnet-4-6'                  // resume/cover letter generation
 const SCORE_MODEL = 'claude-haiku-4-5-20251001'    // job scoring (cheap + fast)
-const SCORE_THRESHOLD = 60                         // notify at or above this score (lowered from 70: prefer noise over misses)
-const SCORE_MAX_PER_RUN = 25                       // cost cap per crawl cycle
+const SCORE_THRESHOLD = 60                         // notify at or above this score
+const SCORE_MAX_PER_RUN = 20                       // cost cap per crawl cycle; the rest wait in the queue
+const NOTIFY_MAX_PER_RUN = 10                      // Telegram messages per cycle; the rest wait in the queue
+const PENDING_TTL_MS = 24 * 60 * 60 * 1000         // retry scoring / sending for at most 24h
+const RECENT_TTL_MS = 14 * 24 * 60 * 60 * 1000     // remember sent matches this long (cross-source dedupe)
+const MAX_BAD_RESPONSES = 3                        // drop a job whose replies keep failing to parse
+const SCORE_FAILURE_BREAKER = 2                    // consecutive API failures → stop scoring this run
 
 const SIMPLIFY_REPO   = 'SimplifyJobs/New-Grad-Positions'
 const SIMPLIFY_BRANCH = 'dev'
@@ -40,6 +46,11 @@ const EXCLUDE_RE = /\b(senior|sr|staff|principal|lead|manager|director|intern|in
 
 const SEEN_KEY = 'seen-v1'       // KV: dedupe state (seen job ids/urls)
 const HEALTH_KEY = 'health-v1'   // KV: per-day run stats for the daily report
+const PENDING_KEY = 'pending-v1' // KV: new jobs waiting to be scored / sent
+
+function workerConfig() {
+  return { threshold: SCORE_THRESHOLD, scoreMax: SCORE_MAX_PER_RUN, notifyMax: NOTIFY_MAX_PER_RUN }
+}
 
 // ═══════════════ Entry points ═══════════════
 
@@ -250,8 +261,14 @@ async function handleApplication(request, env) {
 
 // ═══════════════ AI scoring (Claude Haiku) ═══════════════
 
+// Returns { score, reason } on success, or { error, kind } on failure:
+//   kind 'api'      — the API itself failed (not configured, HTTP error, network);
+//                     usually affects every job, so the caller stops early
+//   kind 'response' — the API answered but the reply was unusable for this job
 export async function scoreJob(env, job) {
-  if (!env.RESUME_SUMMARY || !env.ANTHROPIC_API_KEY) return null
+  if (!env.RESUME_SUMMARY || !env.ANTHROPIC_API_KEY) {
+    return { error: 'RESUME_SUMMARY or ANTHROPIC_API_KEY is not set', kind: 'api' }
+  }
 
   const prompt = `You are screening job postings for a specific candidate. Score how well this job matches the candidate, 0-100.
 
@@ -270,8 +287,9 @@ Salary: ${job.salary || 'unknown'}
 Reply with ONLY this JSON, no other text:
 {"score": <int>, "reason": "<one short sentence>"}`
 
+  let res
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -284,24 +302,169 @@ Reply with ONLY this JSON, no other text:
         messages: [{ role: 'user', content: prompt }],
       }),
     })
-    if (!res.ok) { console.error(`score API ${res.status}`); return null }
+  } catch (e) {
+    return { error: 'network: ' + (e && e.message), kind: 'api' }
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    return { error: `HTTP ${res.status}: ${body.slice(0, 200)}`, kind: 'api' }
+  }
+
+  try {
     const data = await res.json()
     const text = data.content?.[0]?.text ?? ''
     const m = text.match(/\{[\s\S]*\}/)   // extract JSON defensively
-    if (!m) return null
+    if (!m) return { error: 'no JSON in reply', kind: 'response' }
     const parsed = JSON.parse(m[0])
-    const score = Math.min(100, Math.max(0, parseInt(parsed.score, 10)))
-    if (isNaN(score)) return null
-    return { score, reason: String(parsed.reason || '').slice(0, 200) }
+    const score = parseInt(parsed.score, 10)
+    if (isNaN(score)) return { error: 'score is not a number', kind: 'response' }
+    const reason = String(parsed.reason || '').trim().slice(0, 200)
+    return { score: Math.min(100, Math.max(0, score)), reason }
   } catch (e) {
-    console.error('score error: ' + (e && e.message))
-    return null
+    return { error: 'unparseable reply: ' + (e && e.message), kind: 'response' }
   }
+}
+
+// ═══════════════ Scoring queue (KV: pending-v1) ═══════════════
+// New jobs wait here until they are scored and, if they pass the threshold,
+// successfully sent to Telegram. Only jobs discovered by the crawler after
+// this queue existed ever enter it — historical jobs are never scored.
+//
+//   jobs[id]    = job fields + discoveredAt, attempts, badResponses,
+//                 lastError, score, reason, scoredAt
+//   recent[key] = time a match was sent (company|title|location), so the same
+//                 role arriving from another source/URL is not sent twice
+
+export async function loadPending(env, now) {
+  const raw = await env.SEEN.get(PENDING_KEY)
+  const pending = raw ? JSON.parse(raw) : {}
+  pending.jobs = pending.jobs || {}
+  pending.recent = pending.recent || {}
+  for (const [key, at] of Object.entries(pending.recent)) {
+    if (now - at > RECENT_TTL_MS) delete pending.recent[key]
+  }
+  return pending
+}
+
+async function savePending(env, pending) {
+  await env.SEEN.put(PENDING_KEY, JSON.stringify(pending))
+}
+
+export function matchKey(job) {
+  const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+  return `${norm(job.company)}|${norm(job.title)}|${norm(job.location)}`
+}
+
+// Drop entries that can no longer succeed. Never silent: logged + counted.
+function expirePending(pending, cfg, now, log) {
+  for (const [id, item] of Object.entries(pending.jobs)) {
+    if (item.score == null) {
+      if (now - item.discoveredAt > PENDING_TTL_MS || item.badResponses >= MAX_BAD_RESPONSES) {
+        console.error(`unscored job dropped after ${item.attempts} attempts: ${item.company} — ${item.title} (${item.lastError || 'no attempt'})`)
+        delete pending.jobs[id]
+        log.expired++
+      }
+    } else if (item.score < cfg.threshold) {
+      delete pending.jobs[id]   // threshold was raised since it was scored
+    } else if (now - item.scoredAt > PENDING_TTL_MS) {
+      console.error(`match never delivered to Telegram: ${item.company} — ${item.title} (${item.lastError || ''})`)
+      delete pending.jobs[id]
+      log.expired++
+    }
+  }
+}
+
+// Mostly newest first (fresh postings matter most), with about a quarter of
+// each run reserved for the oldest waiting jobs so a backlog keeps moving.
+export function pickForScoring(pending, max) {
+  const unscored = Object.values(pending.jobs)
+    .filter(i => i.score == null)
+    .sort((a, b) => b.discoveredAt - a.discoveredAt)
+  if (unscored.length <= max) return unscored
+  const newest = Math.ceil(max * 0.75)
+  return [...unscored.slice(0, newest), ...unscored.slice(newest).slice(-(max - newest)).reverse()]
+}
+
+async function scorePending(env, pending, cfg, now, log) {
+  const rows = []
+  let apiFailures = 0
+  for (const item of pickForScoring(pending, cfg.scoreMax)) {
+    const r = await scoreJob(env, item)
+    if (r.error) {
+      item.attempts = (item.attempts || 0) + 1
+      item.lastError = r.error
+      log.scoreFailed++
+      console.error(`score failed (attempt ${item.attempts}) ${item.company} — ${item.title}: ${r.error}`)
+      if (r.kind === 'response') {
+        item.badResponses = (item.badResponses || 0) + 1
+        apiFailures = 0
+        continue
+      }
+      // API-level failure: likely affects every job — stop and retry next run
+      if (++apiFailures >= SCORE_FAILURE_BREAKER) break
+      continue
+    }
+    apiFailures = 0
+    item.score = r.score
+    item.reason = r.reason
+    item.scoredAt = now
+    log.scored++
+    rows.push({
+      id: item.id, company: item.company, title: item.title, url: item.url,
+      score: r.score, score_reason: r.reason,
+    })
+    if (r.score < cfg.threshold) delete pending.jobs[item.id]
+  }
+  // One request for all scores (free plan: 50 subrequests per invocation)
+  await sbUpsert(env, 'jobs', rows)
+}
+
+// One message per match. A job leaves the queue only after Telegram accepts
+// it, so failures are retried next run; the first failure ends this run's
+// sending (Telegram down or rate-limited).
+async function notifyPending(env, pending, cfg, now, log) {
+  const ready = Object.values(pending.jobs)
+    .filter(i => i.score != null && i.score >= cfg.threshold)
+    .sort((a, b) => b.score - a.score || a.scoredAt - b.scoredAt)
+
+  let sent = 0
+  for (const item of ready) {
+    const key = matchKey(item)
+    if (pending.recent[key]) {
+      delete pending.jobs[item.id]
+      log.duplicates++
+      continue
+    }
+    if (sent >= cfg.notifyMax) break
+    sent++
+    const res = await sendTelegram(env, formatMatch(item))
+    if (!res.ok) {
+      item.lastError = 'telegram: ' + (res.telegramSays || res.error || res.status)
+      log.notifyFailed++
+      break
+    }
+    delete pending.jobs[item.id]
+    pending.recent[key] = now
+    log.notified++
+  }
+}
+
+export function formatMatch(job) {
+  const where = [job.location, job.salary].filter(Boolean).join('｜')
+  return [
+    '🎯 JobFlow — New Match',
+    `<b>${job.score}/100</b> — ${escapeHtml(job.company)} — ${escapeHtml(job.title)}`,
+    where ? escapeHtml(where) : null,
+    job.reason ? `Reason: ${escapeHtml(job.reason)}` : null,
+    `Apply: <a href="${escapeHtml(job.url)}">${escapeHtml(job.url)}</a>`,
+  ].filter(Boolean).join('\n')
 }
 
 // ═══════════════ Crawler ═══════════════
 
-export async function runCrawler(env) {
+export async function runCrawler(env, now = Date.now()) {
+  const cfg = workerConfig(env)
+
   // Seen-set stored as one KV blob: one read + one write per run (free-tier friendly)
   const raw = await env.SEEN.get(SEEN_KEY)
   const firstRun = raw === null
@@ -310,7 +473,12 @@ export async function runCrawler(env) {
   const newJobs = []
   const closedIds = []
   const newByUrl = new Map()   // this batch, keyed by normalized URL (cross-source salary merge)
-  const log = { simplify: 0, speedy: 0, added: 0, closed: 0, backfilled: 0, scored: 0, notified: 0, mode: firstRun ? 'seed' : 'normal' }
+  const log = {
+    simplify: 0, speedy: 0, added: 0, closed: 0, backfilled: 0,
+    queued: 0, duplicates: 0, scored: 0, scoreFailed: 0, expired: 0,
+    notified: 0, notifyFailed: 0, pending: 0,
+    mode: firstRun ? 'seed' : 'normal',
+  }
 
   // Source 1 (primary): Simplify listings.json
   try {
@@ -341,6 +509,7 @@ export async function runCrawler(env) {
         location: (job.locations || []).join('; '),
         salary: '', source: 'simplify', url: job.url, id: job.id,
         category: job.category || '', sponsorship: job.sponsorship || '',
+        degrees: (job.degrees || []).join(', '),
       }
       newJobs.push(item)
       newByUrl.set(norm, item)
@@ -373,7 +542,7 @@ export async function runCrawler(env) {
       const item = {
         company: job.company, title: job.title, location: job.location,
         salary: job.salary, source: 'speedyapply', url: job.url, id: norm,
-        category: '', sponsorship: '',
+        category: '', sponsorship: '', degrees: '',
       }
       newJobs.push(item)
       newByUrl.set(norm, item)
@@ -416,43 +585,25 @@ export async function runCrawler(env) {
     } catch (e) { console.error('Sheet write error: ' + (e && e.message)) }
   }
 
-  // Score new jobs (capped per run to bound cost), then write all scores
-  // back in ONE request (was one PATCH per job)
-  const scoredRows = []
-  for (const job of newJobs.slice(0, SCORE_MAX_PER_RUN)) {
-    const r = await scoreJob(env, job)
-    if (r) {
-      job.score = r.score
-      job.reason = r.reason
-      log.scored++
-      scoredRows.push({
-        id: job.id, company: job.company, title: job.title, url: job.url,
-        score: r.score, score_reason: r.reason,
-      })
-    }
+  // Queue new jobs, then persist the queue BEFORE the seen-set: if either
+  // write fails, the run aborts and the jobs are rediscovered next cycle.
+  const pending = await loadPending(env, now)
+  for (const j of newJobs) {
+    if (pending.jobs[j.id]) continue
+    if (pending.recent[matchKey(j)]) { log.duplicates++; continue }
+    pending.jobs[j.id] = { ...j, discoveredAt: now, attempts: 0, badResponses: 0 }
+    log.queued++
   }
-  await sbUpsert(env, 'jobs', scoredRows)
-
-  // Notify: high scores, plus unscored ones (if scoring breaks, degrade to noisy — never silent)
-  const toNotify = newJobs.filter(j => j.score == null || j.score >= SCORE_THRESHOLD)
-  log.notified = toNotify.length
-
-  for (let i = 0; i < toNotify.length; i += 8) {
-    const chunk = toNotify.slice(i, i + 8)
-    const lines = chunk.map(j => {
-      const scoreTag = j.score != null ? `${j.score}分 ` : ''
-      const extra = [j.location, j.salary].filter(Boolean).join('｜')
-      return `• ${scoreTag}<a href="${escapeHtml(j.url)}">${escapeHtml(j.company)} — ${escapeHtml(j.title)}</a>` +
-        (j.reason ? `\n   ${escapeHtml(j.reason)}` : '') +
-        (extra ? `\n   ${escapeHtml(extra)}` : '')
-    })
-    await sendTelegram(env,
-      `🎯 高匹配新職缺（${i + 1}–${i + chunk.length}／共 ${toNotify.length}）\n\n${lines.join('\n')}`)
-  }
-
-  // Persist the seen-set last: a mid-run failure retries next cycle
-  // (duplicate notifications beat missed jobs)
+  await savePending(env, pending)
   await env.SEEN.put(SEEN_KEY, JSON.stringify(seen))
+
+  // Score what is waiting (bounded per run), then send passing matches
+  expirePending(pending, cfg, now, log)
+  await scorePending(env, pending, cfg, now, log)
+  await notifyPending(env, pending, cfg, now, log)
+
+  log.pending = Object.keys(pending.jobs).length
+  await savePending(env, pending)
   await updateHealth(env, log)
   console.log(JSON.stringify(log))
   return log
@@ -520,7 +671,8 @@ async function updateHealth(env, log) {
       await sendTelegram(env,
         `🌙 JobFlow 日報（${h.date}）\n` +
         `巡邏 ${h.runs} 輪｜新職缺 ${h.added}｜評分 ${h.scored}｜推播 ${h.notified}｜關閉 ${h.closed}\n` +
-        `系統運作正常 ✅`)
+        `評分失敗 ${h.scoreFailed || 0}｜推播失敗 ${h.notifyFailed || 0}｜放棄（超過 24 小時）${h.expired || 0}｜佇列 ${h.pending ?? 0}\n` +
+        (h.expired ? `⚠️ 有職缺沒能在 24 小時內完成評分或推播，請查看 Worker logs` : `系統運作正常 ✅`))
       h = null
     }
     if (!h) h = { date: today, runs: 0, added: 0, scored: 0, notified: 0, closed: 0 }
@@ -530,6 +682,10 @@ async function updateHealth(env, log) {
     h.scored   += log.scored
     h.notified += log.notified
     h.closed   += log.closed
+    h.scoreFailed  = (h.scoreFailed || 0) + log.scoreFailed
+    h.notifyFailed = (h.notifyFailed || 0) + log.notifyFailed
+    h.expired      = (h.expired || 0) + log.expired
+    h.pending      = log.pending
     h.lastRun = new Date().toISOString()
 
     await env.SEEN.put(HEALTH_KEY, JSON.stringify(h))
@@ -599,7 +755,7 @@ async function sendTelegram(env, text) {
 }
 
 function escapeHtml(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
 // ═══════════════ Parsing & utilities ═══════════════
