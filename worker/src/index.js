@@ -6,6 +6,7 @@
  *                 POST /api/application  record a submitted application
  *                 POST /api/crawl        trigger a crawl manually
  *                 POST /api/test-telegram[?sample=1]  Telegram check / sample match
+ *                 POST /api/test-score   ONE scoring call on a sample job (billable, ~$0.001)
  *                 POST /api/backfill     one-time: load all open jobs into Supabase
  *                 GET  /api/status       health stats
  *   scheduled() — every 30 min: crawl → write Supabase + Sheet → queue new jobs
@@ -20,14 +21,17 @@
 
 const MODEL = 'claude-sonnet-4-6'                  // resume/cover letter generation
 const SCORE_MODEL = 'claude-haiku-4-5-20251001'    // job scoring (cheap + fast)
-// Defaults; override with [vars] in wrangler.toml (SCORE_THRESHOLD, SCORE_MAX_PER_RUN, NOTIFY_MAX_PER_RUN)
+// Defaults; override with [vars] in wrangler.toml (SCORE_THRESHOLD, SCORE_MAX_PER_RUN,
+// SCORE_MAX_PER_DAY, NOTIFY_MAX_PER_RUN)
 const SCORE_THRESHOLD = 70                         // notify at or above this score
 const SCORE_MAX_PER_RUN = 20                       // cost cap per crawl cycle; the rest wait in the queue
+const SCORE_MAX_PER_DAY = 300                      // hard daily cap on scoring calls (UTC day), incl. failures
 const NOTIFY_MAX_PER_RUN = 10                      // Telegram messages per cycle; the rest wait in the queue
 const PENDING_TTL_MS = 24 * 60 * 60 * 1000         // retry scoring / sending for at most 24h
 const RECENT_TTL_MS = 14 * 24 * 60 * 60 * 1000     // remember sent matches this long (cross-source dedupe)
 const MAX_BAD_RESPONSES = 3                        // drop a job whose replies keep failing to parse
 const SCORE_FAILURE_BREAKER = 2                    // consecutive API failures → stop scoring this run
+const SCORE_RETRY_DELAY_MS = 2000                  // one retry for 429 / 5xx / network errors
 
 const SIMPLIFY_REPO   = 'SimplifyJobs/New-Grad-Positions'
 const SIMPLIFY_BRANCH = 'dev'
@@ -57,8 +61,9 @@ export function workerConfig(env) {
   }
   return {
     threshold: int(env.SCORE_THRESHOLD, SCORE_THRESHOLD, 0, 100),
-    scoreMax:  int(env.SCORE_MAX_PER_RUN, SCORE_MAX_PER_RUN, 0, 40),
-    notifyMax: int(env.NOTIFY_MAX_PER_RUN, NOTIFY_MAX_PER_RUN, 0, 20),
+    scoreMax:  int(env.SCORE_MAX_PER_RUN, SCORE_MAX_PER_RUN, 0, 100),
+    scoreDailyMax: int(env.SCORE_MAX_PER_DAY, SCORE_MAX_PER_DAY, 0, 2000),
+    notifyMax: int(env.NOTIFY_MAX_PER_RUN, NOTIFY_MAX_PER_RUN, 0, 30),
   }
 }
 
@@ -90,6 +95,10 @@ export default {
       return json({
         ...(raw ? JSON.parse(raw) : { note: 'no health record yet' }),
         config: workerConfig(env),
+        // Whether each secret is set — never the values
+        configured: Object.fromEntries(['ANTHROPIC_API_KEY', 'RESUME_SUMMARY', 'TG_BOT_TOKEN',
+          'TG_CHAT_ID', 'SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'WORKER_TOKEN']
+          .map(k => [k, Boolean(env[k])])),
         queue: {
           unscored: pending.filter(i => i.score == null).length,
           awaitingTelegram: pending.filter(i => i.score != null).length,
@@ -105,6 +114,13 @@ export default {
       }
       return json(await sendTelegram(env, '🔧 JobFlow 測試 — Worker → Telegram 通了！'))
     }
+    // Diagnostics: exactly one scoring call on a fixed sample job (billable,
+    // about $0.001). Returns the score or the classified API error.
+    if (url.pathname === '/api/test-score' && request.method === 'POST') {
+      if (!authorized(request, env)) return json({ error: 'unauthorized' }, 401)
+      const r = await scoreJob(env, { ...SAMPLE_MATCH, retries: 0 })
+      return json(r.error ? { ok: false, ...r } : { ok: true, ...r })
+    }
     // Popup dashboard: funnel stats + top open, un-applied jobs (reads Supabase)
     if (url.pathname === '/api/summary' && request.method === 'GET') {
       if (!authorized(request, env)) return json({ error: 'unauthorized' }, 401)
@@ -114,7 +130,9 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runCrawler(env))
+    ctx.waitUntil(runCrawler(env).catch(e => {
+      console.error('crawler run aborted: ' + (e && e.stack || e))
+    }))
   },
 }
 
@@ -283,13 +301,14 @@ async function handleApplication(request, env) {
 
 // ═══════════════ AI scoring (Claude Haiku) ═══════════════
 
-// Returns { score, reason } on success, or { error, kind } on failure:
+// Returns { score, reason } on success, or { error, kind, code } on failure:
 //   kind 'api'      — the API itself failed (not configured, HTTP error, network);
 //                     usually affects every job, so the caller stops early
 //   kind 'response' — the API answered but the reply was unusable for this job
+//   code            — short cause for logs and alerts, see classifyScoreError
 export async function scoreJob(env, job) {
   if (!env.RESUME_SUMMARY || !env.ANTHROPIC_API_KEY) {
-    return { error: 'RESUME_SUMMARY or ANTHROPIC_API_KEY is not set', kind: 'api' }
+    return { error: 'RESUME_SUMMARY or ANTHROPIC_API_KEY is not set', kind: 'api', code: 'not_configured' }
   }
 
   // Only listing metadata is available (no full job description); the prompt
@@ -315,42 +334,84 @@ Sponsorship: ${job.sponsorship || 'unknown'}
 Reply with ONLY this JSON, no other text:
 {"score": <int>, "reason": "<one short sentence>"}`
 
-  let res
-  try {
-    res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: SCORE_MODEL,
-        max_tokens: 150,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    })
-  } catch (e) {
-    return { error: 'network: ' + (e && e.message), kind: 'api' }
+  const request = () => fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': env.ANTHROPIC_API_KEY.trim(),
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: SCORE_MODEL,
+      max_tokens: 150,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  })
+
+  // One retry for transient failures (rate limit, overload, 5xx, network).
+  // Auth / billing / bad-request errors are not retried: they will not fix themselves.
+  const retries = job.retries ?? 1
+  let res, failure
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    failure = null
+    try {
+      res = await request()
+    } catch (e) {
+      failure = { error: 'network: ' + (e && e.message), kind: 'api', code: 'network' }
+    }
+    if (!failure && !res.ok) {
+      const body = await res.text().catch(() => '')
+      failure = { error: `HTTP ${res.status}: ${body.slice(0, 200)}`, kind: 'api',
+        code: classifyScoreError(res.status, body) }
+    }
+    if (!failure || !['rate_limit', 'overloaded', 'server', 'network'].includes(failure.code)) break
+    if (attempt < retries) {
+      const after = parseInt(res?.headers?.get('retry-after'), 10)
+      const def = parseInt(env.SCORE_RETRY_DELAY_MS ?? SCORE_RETRY_DELAY_MS, 10) || 0
+      await new Promise(r => setTimeout(r, Math.min(isNaN(after) ? def : after * 1000, 10000, def * 5)))
+    }
   }
-  if (!res.ok) {
-    const body = await res.text().catch(() => '')
-    return { error: `HTTP ${res.status}: ${body.slice(0, 200)}`, kind: 'api' }
-  }
+  if (failure) return failure
 
   try {
     const data = await res.json()
     const text = data.content?.[0]?.text ?? ''
     const m = text.match(/\{[\s\S]*\}/)   // extract JSON defensively
-    if (!m) return { error: 'no JSON in reply', kind: 'response' }
+    if (!m) return { error: 'no JSON in reply', kind: 'response', code: 'bad_reply' }
     const parsed = JSON.parse(m[0])
     const score = parseInt(parsed.score, 10)
-    if (isNaN(score)) return { error: 'score is not a number', kind: 'response' }
+    if (isNaN(score)) return { error: 'score is not a number', kind: 'response', code: 'bad_reply' }
     const reason = String(parsed.reason || '').trim().slice(0, 200)
     return { score: Math.min(100, Math.max(0, score)), reason }
   } catch (e) {
-    return { error: 'unparseable reply: ' + (e && e.message), kind: 'response' }
+    return { error: 'unparseable reply: ' + (e && e.message), kind: 'response', code: 'bad_reply' }
   }
+}
+
+// Anthropic API error → short code. The error body's type field is checked
+// first, then the status (https://docs.anthropic.com/en/api/errors).
+export function classifyScoreError(status, body = '') {
+  if (/credit balance|billing|purchase credits/i.test(body)) return 'credit'
+  if (status === 401 || status === 403 || /authentication_error|permission_error/.test(body)) return 'auth'
+  if (status === 404 || /not_found_error/.test(body)) return 'model'
+  if (status === 429 || /rate_limit_error/.test(body)) return 'rate_limit'
+  if (status === 529 || /overloaded_error/.test(body)) return 'overloaded'
+  if (status >= 500) return 'server'
+  return 'bad_request'
+}
+
+// What each code means, in the alert language; the action is what to check
+const SCORE_ERROR_HINTS = {
+  not_configured: 'ANTHROPIC_API_KEY 或 RESUME_SUMMARY 沒有設定',
+  credit: 'Anthropic 帳戶額度不足（請到 Console → Billing 查看）',
+  auth: 'API key 無效或已停用（請到 Console → API Keys 查看）',
+  model: '評分 model 名稱無效或已停用',
+  rate_limit: 'Anthropic 限流（429）',
+  overloaded: 'Anthropic 暫時過載（529）',
+  server: 'Anthropic 伺服器錯誤（5xx）',
+  network: '連不上 Anthropic API',
+  bad_request: 'API 請求被拒絕（400）',
+  bad_reply: 'AI 回覆格式無法解析',
 }
 
 // ═══════════════ Scoring queue (KV: pending-v1) ═══════════════
@@ -408,20 +469,28 @@ export function pickForScoring(pending, max) {
   const unscored = Object.values(pending.jobs)
     .filter(i => i.score == null)
     .sort((a, b) => b.discoveredAt - a.discoveredAt)
+  if (max <= 0) return []   // note: slice(-0) would return everything
   if (unscored.length <= max) return unscored
   const newest = Math.ceil(max * 0.75)
   return [...unscored.slice(0, newest), ...unscored.slice(newest).slice(-(max - newest)).reverse()]
 }
 
-async function scorePending(env, pending, cfg, now, log) {
+async function scorePending(env, pending, cfg, now, log, usedToday) {
   const rows = []
   let apiFailures = 0
-  for (const item of pickForScoring(pending, cfg.scoreMax)) {
+  const budget = Math.max(0, Math.min(cfg.scoreMax, cfg.scoreDailyMax - usedToday))
+  if (budget < cfg.scoreMax && pickForScoring(pending, cfg.scoreMax).length > budget) {
+    log.scoreCapped = true
+    console.error(`daily scoring cap reached (${cfg.scoreDailyMax}); the rest wait in the queue`)
+  }
+  for (const item of pickForScoring(pending, budget)) {
     const r = await scoreJob(env, item)
     if (r.error) {
       item.attempts = (item.attempts || 0) + 1
       item.lastError = r.error
       log.scoreFailed++
+      log.scoreErrorCode = r.code
+      log.scoreError = r.error.slice(0, 200)
       console.error(`score failed (attempt ${item.attempts}) ${item.company} — ${item.title}: ${r.error}`)
       if (r.kind === 'response') {
         item.badResponses = (item.badResponses || 0) + 1
@@ -511,7 +580,8 @@ export async function runCrawler(env, now = Date.now()) {
   const log = {
     simplify: 0, speedy: 0, added: 0, closed: 0, backfilled: 0,
     queued: 0, duplicates: 0, scored: 0, scoreFailed: 0, expired: 0,
-    notified: 0, notifyFailed: 0, pending: 0,
+    notified: 0, notifyFailed: 0, pending: 0, scoreCapped: false,
+    scoreErrorCode: null, scoreError: null,
     mode: firstRun ? 'seed' : 'normal',
   }
 
@@ -630,16 +700,21 @@ export async function runCrawler(env, now = Date.now()) {
     log.queued++
   }
   await savePending(env, pending)
-  await env.SEEN.put(SEEN_KEY, JSON.stringify(seen))
+  // seen-v1 is ~2 MB: only rewrite it when something changed (saves CPU and a KV write)
+  if (newJobs.length > 0 || closedIds.length > 0) {
+    await env.SEEN.put(SEEN_KEY, JSON.stringify(seen))
+  }
 
-  // Score what is waiting (bounded per run), then send passing matches
+  // Score what is waiting (bounded per run and per day), then send passing matches
+  const health = await loadHealth(env)
+  const usedToday = health && !health.stale ? (health.scored || 0) + (health.scoreFailed || 0) : 0
   expirePending(pending, cfg, now, log)
-  await scorePending(env, pending, cfg, now, log)
+  await scorePending(env, pending, cfg, now, log, usedToday)
   await notifyPending(env, pending, cfg, now, log)
 
   log.pending = Object.keys(pending.jobs).length
   await savePending(env, pending)
-  await updateHealth(env, log)
+  await updateHealth(env, log, health)
   console.log(JSON.stringify(log))
   return log
 }
@@ -695,19 +770,43 @@ async function buildSummary(env) {
 // Makes silent failure visible: stats accumulate per day in KV, and the first
 // run after midnight sends yesterday's report. A missing report IS the alarm.
 
-async function updateHealth(env, log) {
+// Today's health record, or null if none yet / it belongs to an earlier day.
+// The daily scoring cap counts from this.
+async function loadHealth(env) {
+  try {
+    const raw = await env.SEEN.get(HEALTH_KEY)
+    const h = raw ? JSON.parse(raw) : null
+    return h && h.date === new Date().toISOString().slice(0, 10) ? h : (h ? { ...h, stale: true } : null)
+  } catch (e) {
+    console.error('health read error: ' + (e && e.message))
+    return null
+  }
+}
+
+export function formatDailyReport(h) {
+  const warnings = []
+  if (h.scoreFailed && !h.scored) {
+    warnings.push(`⚠️ 今天評分全部失敗，沒有推薦任何職缺。原因：${SCORE_ERROR_HINTS[h.lastScoreErrorCode] || h.lastScoreErrorCode || '不明'}`)
+  } else if (h.scoreFailed) {
+    warnings.push(`⚠️ 部分評分失敗，最近一次的原因：${SCORE_ERROR_HINTS[h.lastScoreErrorCode] || h.lastScoreErrorCode || '不明'}`)
+  }
+  if (h.scoreCapped) warnings.push('⚠️ 達到每日評分上限，其餘職缺留在佇列中')
+  if (h.expired) warnings.push('⚠️ 有職缺沒能在 24 小時內完成評分或推播，請查看 Worker logs')
+  return `🌙 JobFlow 日報（${h.date}）\n` +
+    `巡邏 ${h.runs} 輪｜新職缺 ${h.added}｜評分 ${h.scored}｜推播 ${h.notified}｜關閉 ${h.closed}\n` +
+    `評分失敗 ${h.scoreFailed || 0}｜推播失敗 ${h.notifyFailed || 0}｜放棄（超過 24 小時）${h.expired || 0}｜佇列 ${h.pending ?? 0}\n` +
+    (warnings.length ? warnings.join('\n') : '系統運作正常 ✅')
+}
+
+async function updateHealth(env, log, current) {
   try {
     const today = new Date().toISOString().slice(0, 10)
-    const raw = await env.SEEN.get(HEALTH_KEY)
-    let h = raw ? JSON.parse(raw) : null
+    let h = current === undefined ? await loadHealth(env) : current
 
     // Day rolled over: send yesterday's report, then start a fresh page
-    if (h && h.date !== today) {
-      await sendTelegram(env,
-        `🌙 JobFlow 日報（${h.date}）\n` +
-        `巡邏 ${h.runs} 輪｜新職缺 ${h.added}｜評分 ${h.scored}｜推播 ${h.notified}｜關閉 ${h.closed}\n` +
-        `評分失敗 ${h.scoreFailed || 0}｜推播失敗 ${h.notifyFailed || 0}｜放棄（超過 24 小時）${h.expired || 0}｜佇列 ${h.pending ?? 0}\n` +
-        (h.expired ? `⚠️ 有職缺沒能在 24 小時內完成評分或推播，請查看 Worker logs` : `系統運作正常 ✅`))
+    if (h && h.stale) {
+      delete h.stale
+      await sendTelegram(env, formatDailyReport(h))
       h = null
     }
     if (!h) h = { date: today, runs: 0, added: 0, scored: 0, notified: 0, closed: 0 }
@@ -722,6 +821,22 @@ async function updateHealth(env, log) {
     h.expired      = (h.expired || 0) + log.expired
     h.pending      = log.pending
     h.lastRun = new Date().toISOString()
+    if (log.scoreCapped) h.scoreCapped = true
+    if (log.scoreErrorCode) {
+      h.lastScoreErrorCode = log.scoreErrorCode
+      h.lastScoreError = log.scoreError
+      h.lastScoreErrorAt = h.lastRun
+    }
+
+    // Scoring is failing and nothing has scored today: alert once per day per
+    // cause, instead of waiting for tomorrow's report. Jobs stay queued for 24h.
+    const code = log.scoreErrorCode
+    if (code && code !== 'bad_reply' && !h.scored && !(h.alerted || {})[code]) {
+      const r = await sendTelegram(env,
+        `⚠️ JobFlow 評分失敗：${SCORE_ERROR_HINTS[code] || code}\n` +
+        `新職缺會留在佇列中，24 小時內每輪自動重試。修好之後不需要其他操作。`)
+      if (r.ok) h.alerted = { ...(h.alerted || {}), [code]: true }
+    }
 
     await env.SEEN.put(HEALTH_KEY, JSON.stringify(h))
   } catch (e) {

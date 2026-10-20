@@ -6,7 +6,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   runCrawler, scoreJob, pickForScoring, formatMatch, matchKey, workerConfig,
+  classifyScoreError, formatDailyReport,
 } from '../src/index.js'
+import worker from '../src/index.js'
 
 const HOUR = 60 * 60 * 1000
 const T0 = Date.UTC(2026, 9, 20, 12, 0, 0)
@@ -47,6 +49,7 @@ function world({ listings = [], speedy = '', seen = { ids: {}, urls: {}, closed:
     TG_CHAT_ID: '123',
     SUPABASE_URL: 'https://sb.example.com',
     SUPABASE_SERVICE_KEY: 'sb-key',
+    SCORE_RETRY_DELAY_MS: '0',
     ...vars,
   }
   w.fetch = async (url, opts = {}) => {
@@ -60,7 +63,7 @@ function world({ listings = [], speedy = '', seen = { ids: {}, urls: {}, closed:
       w.prompts.push(prompt)
       const company = prompt.match(/^Company: (.*)$/m)[1]
       const r = w.score(company)
-      if (r.http) return new Response('upstream error', { status: r.http })
+      if (r.http) return new Response(r.body || 'upstream error', { status: r.http })
       if (r.raw != null) return new Response(JSON.stringify({ content: [{ text: r.raw }] }))
       return new Response(JSON.stringify({ content: [{ text: JSON.stringify(r) }] }))
     }
@@ -86,6 +89,7 @@ function world({ listings = [], speedy = '', seen = { ids: {}, urls: {}, closed:
 }
 
 const matches = w => w.messages.filter(m => m.includes('New Match'))
+const alerts = w => w.messages.filter(m => m.includes('評分失敗：'))
 
 // ── Only newly discovered jobs ─────────────────────────────
 
@@ -131,9 +135,10 @@ test('scoring API down: nothing is sent, jobs stay queued, breaker stops early',
   const w = world({ listings: [1, 2, 3, 4, 5].map(i => listing(i)) })
   w.score = () => ({ http: 529 })
   const log = await w.run(T0)
-  assert.equal(w.calls.claude, 2, 'stops after 2 consecutive API failures')
+  assert.equal(w.calls.claude, 4, '2 jobs × (1 try + 1 retry), then the breaker stops')
   assert.equal(log.scoreFailed, 2)
-  assert.equal(w.calls.telegram, 0, 'no unscored recommendations')
+  assert.equal(matches(w).length, 0, 'no unscored recommendations')
+  assert.equal(alerts(w).length, 1, 'one failure alert')
   assert.equal(Object.keys(w.pending().jobs).length, 5)
 })
 
@@ -142,7 +147,8 @@ test('missing RESUME_SUMMARY: nothing is sent unscored', async () => {
   const log = await w.run(T0)
   assert.equal(log.scoreFailed >= 1, true)
   assert.equal(w.calls.claude, 0)
-  assert.equal(w.calls.telegram, 0)
+  assert.equal(matches(w).length, 0)
+  assert.ok(alerts(w)[0].includes('沒有設定'))
   assert.equal(Object.keys(w.pending().jobs).length, 1)
 })
 
@@ -166,7 +172,7 @@ test('job still unscored after 24h is dropped, counted, and never sent', async (
   w.score = () => ({ score: 99, reason: 'too late' })
   const log = await w.run(T0 + 25 * HOUR)
   assert.equal(log.expired, 1)
-  assert.equal(w.calls.telegram, 0)
+  assert.equal(matches(w).length, 0)
   assert.equal(Object.keys(w.pending().jobs).length, 0)
 })
 
@@ -206,6 +212,11 @@ test('pickForScoring: newest first, about a quarter reserved for the oldest', ()
   assert.ok(!picked.includes('done'))
 })
 
+test('pickForScoring with a cap of 0 picks nothing (SCORE_MAX_PER_RUN="0" pauses scoring)', () => {
+  const jobs = { a: { id: 'a', discoveredAt: T0 }, b: { id: 'b', discoveredAt: T0 + 1 } }
+  assert.deepEqual(pickForScoring({ jobs }, 0), [])
+})
+
 test('run stays within the free-plan subrequest budget with a large backlog', async () => {
   const w = world({ listings: Array.from({ length: 200 }, (_, i) => listing(i)) })
   w.score = () => ({ score: 95, reason: 'great' })
@@ -232,9 +243,10 @@ test('threshold is configurable via SCORE_THRESHOLD', async () => {
 })
 
 test('workerConfig defaults and clamping', () => {
-  assert.deepEqual(workerConfig({}), { threshold: 70, scoreMax: 20, notifyMax: 10 })
-  assert.deepEqual(workerConfig({ SCORE_THRESHOLD: '250', SCORE_MAX_PER_RUN: 'x', NOTIFY_MAX_PER_RUN: '-3' }),
-    { threshold: 100, scoreMax: 20, notifyMax: 0 })
+  assert.deepEqual(workerConfig({}), { threshold: 70, scoreMax: 20, scoreDailyMax: 300, notifyMax: 10 })
+  assert.deepEqual(workerConfig({
+    SCORE_THRESHOLD: '250', SCORE_MAX_PER_RUN: 'x', NOTIFY_MAX_PER_RUN: '-3', SCORE_MAX_PER_DAY: '99999',
+  }), { threshold: 100, scoreMax: 20, scoreDailyMax: 2000, notifyMax: 0 })
 })
 
 // ── Duplicate prevention ───────────────────────────────────
@@ -341,7 +353,7 @@ test('prompt includes listing metadata already available', async () => {
 })
 
 test('scoreJob distinguishes API failures from bad replies', async () => {
-  const env = { RESUME_SUMMARY: 'x', ANTHROPIC_API_KEY: 'k' }
+  const env = { RESUME_SUMMARY: 'x', ANTHROPIC_API_KEY: 'k', SCORE_RETRY_DELAY_MS: '0' }
   globalThis.fetch = async () => new Response('nope', { status: 401 })
   assert.equal((await scoreJob(env, {})).kind, 'api')
   globalThis.fetch = async () => { throw new Error('offline') }
@@ -369,4 +381,128 @@ test('formatMatch escapes HTML and omits empty lines', () => {
 test('matchKey ignores case and punctuation', () => {
   assert.equal(matchKey({ company: 'Acme, Inc.', title: 'Software Engineer I', location: 'New York, NY' }),
     matchKey({ company: 'ACME Inc', title: 'software engineer i', location: 'New York NY' }))
+})
+
+// ── Scoring failures are classified, retried once, and alerted ──
+
+test('classifyScoreError maps Anthropic errors to causes', () => {
+  const body = (type, message) => JSON.stringify({ type: 'error', error: { type, message } })
+  assert.equal(classifyScoreError(401, body('authentication_error', 'invalid x-api-key')), 'auth')
+  assert.equal(classifyScoreError(400, body('invalid_request_error',
+    'Your credit balance is too low to access the Anthropic API.')), 'credit')
+  assert.equal(classifyScoreError(400, body('invalid_request_error', 'max_tokens: bad')), 'bad_request')
+  assert.equal(classifyScoreError(404, body('not_found_error', 'model: x')), 'model')
+  assert.equal(classifyScoreError(429, body('rate_limit_error', 'slow down')), 'rate_limit')
+  assert.equal(classifyScoreError(529, body('overloaded_error', 'Overloaded')), 'overloaded')
+  assert.equal(classifyScoreError(503, ''), 'server')
+})
+
+test('transient error is retried once within the run; auth error is not', async () => {
+  const env = { RESUME_SUMMARY: 'x', ANTHROPIC_API_KEY: 'k', SCORE_RETRY_DELAY_MS: '0' }
+  let calls = 0
+  globalThis.fetch = async () => ++calls === 1
+    ? new Response('{"error":{"type":"overloaded_error"}}', { status: 529 })
+    : new Response(JSON.stringify({ content: [{ text: '{"score": 75, "reason": "ok"}' }] }))
+  assert.deepEqual(await scoreJob(env, {}), { score: 75, reason: 'ok' })
+  assert.equal(calls, 2)
+
+  calls = 0
+  globalThis.fetch = async () => { calls++; return new Response('{"error":{"type":"authentication_error"}}', { status: 401 }) }
+  const r = await scoreJob(env, {})
+  assert.equal(r.code, 'auth')
+  assert.equal(calls, 1, 'auth errors are not retried')
+})
+
+test('all scoring failing: one alert per day per cause, with the cause', async () => {
+  const w = world({ listings: [listing(1), listing(2)] })
+  w.score = () => ({ http: 400, body: '{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low"}}' })
+  await w.run(T0)
+  await w.run(T0 + HOUR / 2)
+  assert.equal(alerts(w).length, 1, 'not repeated every run')
+  assert.ok(alerts(w)[0].includes('額度不足'))
+  const h = JSON.parse(w.kv.get('health-v1'))
+  assert.equal(h.lastScoreErrorCode, 'credit')
+  assert.ok(!JSON.stringify(h).includes('test-key'), 'no secret in health record')
+})
+
+test('no alert when scoring works', async () => {
+  const w = world({ listings: [listing(1)] })
+  await w.run(T0)
+  assert.equal(alerts(w).length, 0)
+})
+
+test('daily report says clearly when every score failed', () => {
+  const base = { date: '2026-10-19', runs: 48, added: 12, scored: 0, notified: 0, closed: 1,
+    scoreFailed: 30, notifyFailed: 0, expired: 0, pending: 12 }
+  const text = formatDailyReport({ ...base, lastScoreErrorCode: 'auth' })
+  assert.ok(text.includes('今天評分全部失敗'))
+  assert.ok(text.includes('API key 無效'))
+  assert.ok(!text.includes('系統運作正常'))
+  assert.ok(formatDailyReport({ ...base, scored: 10, scoreFailed: 0 }).includes('系統運作正常 ✅'))
+})
+
+test('daily scoring cap stops calls and is reported', async () => {
+  const w = world({ listings: Array.from({ length: 10 }, (_, i) => listing(i)), vars: { SCORE_MAX_PER_DAY: '6' } })
+  w.score = () => ({ score: 50, reason: 'meh' })
+  const l1 = await w.run(T0)
+  assert.equal(l1.scored, 6)
+  assert.equal(l1.scoreCapped, true)
+  const l2 = await w.run(T0 + HOUR / 2)
+  assert.equal(l2.scored, 0, 'cap counts the whole day')
+  assert.equal(w.calls.claude, 6)
+  assert.equal(l2.pending, 4, 'capped jobs wait, not dropped')
+})
+
+test('seen-v1 is not rewritten when nothing changed', async () => {
+  const w = world({ listings: [listing(1)] })
+  await w.run(T0)
+  let writes = 0
+  const put = w.env.SEEN.put
+  w.env.SEEN.put = async (k, v) => { if (k === 'seen-v1') writes++; return put(k, v) }
+  await w.run(T0 + HOUR / 2)
+  assert.equal(writes, 0)
+  w.listings = [listing(1), listing(2)]
+  await w.run(T0 + HOUR)
+  assert.equal(writes, 1)
+})
+
+// ── HTTP endpoints ─────────────────────────────────────────
+
+test('/api/status reports which secrets are set, never their values', async () => {
+  const w = world({ listings: [listing(1)], vars: { WORKER_TOKEN: 'tok' } })
+  await w.run(T0)
+  const res = await worker.fetch(new Request('https://w.example.com/api/status',
+    { headers: { Authorization: 'Bearer tok' } }), w.env)
+  const body = await res.text()
+  const data = JSON.parse(body)
+  assert.equal(data.configured.ANTHROPIC_API_KEY, true)
+  assert.equal(data.configured.RESUME_SUMMARY, true)
+  for (const secret of ['test-key', 'test-token', 'sb-key', 'MS CS']) assert.ok(!body.includes(secret))
+  const denied = await worker.fetch(new Request('https://w.example.com/api/status'), w.env)
+  assert.equal(denied.status, 401)
+})
+
+test('/api/test-score makes exactly one call and returns the classified error', async () => {
+  const w = world({ vars: { WORKER_TOKEN: 'tok' } })
+  w.score = () => ({ http: 401, body: '{"type":"error","error":{"type":"authentication_error"}}' })
+  globalThis.fetch = w.fetch
+  const req = () => new Request('https://w.example.com/api/test-score',
+    { method: 'POST', headers: { Authorization: 'Bearer tok' } })
+  const r = await (await worker.fetch(req(), w.env)).json()
+  assert.equal(r.ok, false)
+  assert.equal(r.code, 'auth')
+  assert.equal(w.calls.claude, 1)
+  w.score = () => ({ score: 88, reason: 'fine' })
+  assert.deepEqual(await (await worker.fetch(req(), w.env)).json(), { ok: true, score: 88, reason: 'fine' })
+  const denied = await worker.fetch(new Request('https://w.example.com/api/test-score', { method: 'POST' }), w.env)
+  assert.equal(denied.status, 401)
+})
+
+test('extension endpoints still exist with the same auth', async () => {
+  const w = world({ vars: { WORKER_TOKEN: 'tok' } })
+  globalThis.fetch = w.fetch
+  for (const [path, method] of [['/api/generate', 'POST'], ['/api/application', 'POST'], ['/api/summary', 'GET']]) {
+    const res = await worker.fetch(new Request('https://w.example.com' + path, { method }), w.env)
+    assert.equal(res.status, 401, path + ' requires the token')
+  }
 })
