@@ -10,6 +10,15 @@
   <div class="container">
     <h1>Resume Helper</h1>
 
+    <!-- Workday: shown only on a *.myworkdayjobs.com tab; nothing runs until clicked -->
+    <div id="workdayPanel" class="workday-panel hidden">
+      <div class="section-label">Workday 申請表</div>
+      <div class="hint">請先自行登入並進入申請表。只會填空白的姓名、Email、電話、LinkedIn、GitHub，不會點擊或提交任何東西。</div>
+      <button id="workdayFillBtn" class="btn-primary">Autofill 這一頁</button>
+      <button id="workdayResumeBtn" class="btn-secondary">上傳履歷 PDF</button>
+      <div id="workdayStatus" class="upload-status hidden"></div>
+    </div>
+
     <!-- Tabs -->
     <div class="tabs">
       <button class="tab active" data-tab="profile">個人資料</button>

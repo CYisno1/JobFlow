@@ -7,6 +7,24 @@ compatibility_date = "2026-07-01"
 [triggers]
 crons = ["*/30 * * * *"]
 
+# Workers Paid plan required: one crawl parses a ~13 MB listings file, which
+# needs ~150-250 ms CPU — over the Free plan's 10 ms. cpu_ms caps a single
+# invocation (runaway protection). Free accounts cannot raise this limit.
+[limits]
+cpu_ms = 5000
+
+# Worker logs (console.log / console.error) in the dashboard
+[observability]
+enabled = true
+
+# Tunables (plain values, not secrets). Changing them needs a redeploy.
+# NOTE: wrangler deploy replaces ALL plaintext vars on the dashboard with these.
+[vars]
+SCORE_THRESHOLD = "70"      # send Telegram matches at or above this AI score (0-100)
+SCORE_MAX_PER_RUN = "20"    # jobs scored per 30-min run; the rest wait in the queue ("0" pauses scoring)
+SCORE_MAX_PER_DAY = "300"   # hard daily cap on scoring calls (cost guard, UTC day)
+NOTIFY_MAX_PER_RUN = "10"   # Telegram messages per run; the rest wait in the queue
+
 # KV binding: env.SEEN in code maps to this namespace
 [[kv_namespaces]]
 binding = "SEEN"

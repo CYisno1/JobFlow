@@ -225,6 +225,39 @@ textarea:focus {
   cursor: not-allowed;
 }
 
+.btn-secondary {
+  width: 100%;
+  padding: 8px;
+  background: white;
+  color: #6366f1;
+  border: 1px solid #c7d2fe;
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  margin-top: 6px;
+}
+
+.btn-secondary:disabled {
+  color: #a5b4fc;
+  cursor: not-allowed;
+}
+
+/* Workday panel */
+.workday-panel {
+  background: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 14px;
+}
+
+.workday-panel .upload-status {
+  margin: 8px 0 0;
+  text-align: left;
+  white-space: pre-line;
+}
+
 /* Save status */
 .save-status {
   text-align: center;
