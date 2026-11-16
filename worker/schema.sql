@@ -13,7 +13,7 @@ create table if not exists jobs (
   url          text not null,
   locations    text,
   salary       text,
-  source       text,                      -- simplify / speedyapply
+  source       text,                      -- simplify / speedyapply / speedyapply-ai / ml-newgrad / agnikulu
   ats_type     text,                      -- greenhouse / lever / workday... (derived later)
   category     text,
   sponsorship  text,
