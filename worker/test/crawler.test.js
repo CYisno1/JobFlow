@@ -936,3 +936,11 @@ test('/api/status shows which added sources are baselined, without secrets', asy
   assert.deepEqual(Object.keys(data.sourceSeed).sort(), ['agnikulu', 'ml-newgrad', 'speedyapply-ai'])
   assert.ok(!JSON.stringify(data).includes('sb-key'))
 })
+
+test('every named export is a function (the Workers runtime rejects other exports at startup)', async () => {
+  const mod = await import('../src/index.js')
+  for (const [name, value] of Object.entries(mod)) {
+    if (name === 'default') continue
+    assert.equal(typeof value, 'function', `export ${name} must be a function`)
+  }
+})

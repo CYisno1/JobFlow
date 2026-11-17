@@ -43,9 +43,9 @@ const SPEEDY_MD_URL     = `https://raw.githubusercontent.com/${SPEEDY_REPO}/main
 
 // AI / ML boards (sources 3-5). Each one gets its own silent first-crawl
 // baseline (KV source-seed-v1), so adding a source never floods Telegram.
-export const SPEEDY_AI_MD_URL  = 'https://raw.githubusercontent.com/speedyapply/2027-AI-College-Jobs/main/NEW_GRAD_USA.md'
-export const ML_NEWGRAD_MD_URL = 'https://raw.githubusercontent.com/Tar-ive/ML_Newgrad_2027/main/README.md'
-export const AGNIKULU_JSON_URL = 'https://raw.githubusercontent.com/Agnikulu/Job-Postings/main/jobs_archive.json'
+const SPEEDY_AI_MD_URL  = 'https://raw.githubusercontent.com/speedyapply/2027-AI-College-Jobs/main/NEW_GRAD_USA.md'
+const ML_NEWGRAD_MD_URL = 'https://raw.githubusercontent.com/Tar-ive/ML_Newgrad_2027/main/README.md'
+const AGNIKULU_JSON_URL = 'https://raw.githubusercontent.com/Agnikulu/Job-Postings/main/jobs_archive.json'
 
 const KEYWORDS = [
   'software', 'engineer', 'developer', 'data', 'machine learning',
@@ -1010,11 +1010,15 @@ export function matchesKeywords(text) {
 // URLs) or throws when the document is not in the expected format at all.
 // A valid document with zero rows is { jobs: [], skipped: 0 }, not an error.
 
-export const EXTRA_SOURCES = [
+// Not exported directly: the Workers runtime only accepts functions / handlers
+// as module exports, so a constant export stops the Worker from starting.
+const EXTRA_SOURCES = [
   { name: 'speedyapply-ai', url: SPEEDY_AI_MD_URL, parse: parseSpeedyAiMarkdown },
   { name: 'ml-newgrad', url: ML_NEWGRAD_MD_URL, parse: parseMlNewgradMarkdown },
   { name: 'agnikulu', url: AGNIKULU_JSON_URL, parse: parseAgnikuluJson },
 ]
+
+export function extraSources() { return EXTRA_SOURCES }
 
 // Link shorteners / redirectors: the real destination is unknown until followed,
 // and the crawler never follows application links, so these rows are skipped.

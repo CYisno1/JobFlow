@@ -3,10 +3,10 @@
 // No KV, Supabase, Telegram, Anthropic or Cloudflare calls; no credentials.
 // Not part of `npm test` (network). Run: node worker/test/sources.smoke.mjs
 
-import { EXTRA_SOURCES, matchesKeywords, normalizeUrl } from '../src/index.js'
+import { extraSources, matchesKeywords, normalizeUrl } from '../src/index.js'
 
 let failed = 0
-for (const src of EXTRA_SOURCES) {
+for (const src of extraSources()) {
   try {
     const res = await fetch(src.url)
     if (!res.ok) throw new Error('HTTP ' + res.status)
