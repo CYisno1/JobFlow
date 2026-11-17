@@ -7,7 +7,7 @@ one crawl needs ~150–250 ms CPU; the Free plan allows 10 ms).
 ## Architecture
 
 ```
-cron (30 min) → crawl 2 sources → dedupe (KV seen-v1) → Supabase jobs (+ Sheet, transitional)
+cron (30 min) → crawl 5 sources → dedupe (KV seen-v1; new sources baselined silently via source-seed-v1) → Supabase jobs (+ Sheet, transitional)
              → queue new jobs (KV pending-v1) → score from the queue (Claude Haiku vs RESUME_SUMMARY)
              → scored ≥ SCORE_THRESHOLD (70) → Telegram, one message per job
 extension submit → POST /api/application → Supabase applications (+ Sheet)

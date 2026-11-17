@@ -6,7 +6,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   runCrawler, scoreJob, pickForScoring, formatMatch, matchKey, workerConfig,
-  classifyScoreError, formatDailyReport,
+  classifyScoreError, formatDailyReport, matchesKeywords, safeApplyUrl,
+  parseSpeedyAiMarkdown, parseMlNewgradMarkdown, parseAgnikuluJson,
 } from '../src/index.js'
 import worker from '../src/index.js'
 
@@ -22,22 +23,39 @@ function listing(i, extra = {}) {
   }
 }
 
-// In-memory world: KV, GitHub sources, Claude, Telegram, Supabase
-function world({ listings = [], speedy = '', seen = { ids: {}, urls: {}, closed: {} }, vars = {} } = {}) {
+// Exact source URLs: each one has its own fixture, so a fixture can never be
+// served for the wrong source (both speedyapply files are NEW_GRAD_USA.md)
+const URLS = {
+  simplify: 'https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json',
+  speedy: 'https://raw.githubusercontent.com/speedyapply/2027-SWE-College-Jobs/main/NEW_GRAD_USA.md',
+  speedyAi: 'https://raw.githubusercontent.com/speedyapply/2027-AI-College-Jobs/main/NEW_GRAD_USA.md',
+  mlNewgrad: 'https://raw.githubusercontent.com/Tar-ive/ML_Newgrad_2027/main/README.md',
+  agnikulu: 'https://raw.githubusercontent.com/Agnikulu/Job-Postings/main/jobs_archive.json',
+}
+
+// In-memory world: KV, GitHub sources, Claude, Telegram, Supabase.
+// speedyAi / mlNewgrad / agnikulu: fixture text, or null → HTTP 404.
+function world({ listings = [], speedy = '', speedyAi = null, mlNewgrad = null, agnikulu = null,
+  seen = { ids: {}, urls: {}, closed: {} }, vars = {} } = {}) {
   const kv = new Map()
   if (seen) kv.set('seen-v1', JSON.stringify(seen))
   const w = {
-    kv, listings, speedy,
+    kv, listings, speedy, speedyAi, mlNewgrad, agnikulu,
+    sourceStatus: {},   // URLS key (e.g. mlNewgrad) → HTTP status to return instead of the fixture
     score: () => ({ score: 85, reason: 'Good fit.' }),   // per-job behaviour, by company
     telegramOk: () => true,
     failKvPut: null,
-    calls: { claude: 0, telegram: 0, supabase: 0, total: 0 },
+    failKvGet: null,
+    calls: { claude: 0, telegram: 0, supabase: 0, total: 0, sources: {}, other: [] },
     messages: [],
     prompts: [],
   }
   w.env = {
     SEEN: {
-      get: async k => kv.get(k) ?? null,
+      get: async k => {
+        if (w.failKvGet === k) throw new Error('KV read failed')
+        return kv.get(k) ?? null
+      },
       put: async (k, v) => {
         if (w.failKvPut === k) throw new Error('KV write failed')
         kv.set(k, v)
@@ -55,8 +73,17 @@ function world({ listings = [], speedy = '', seen = { ids: {}, urls: {}, closed:
   w.fetch = async (url, opts = {}) => {
     url = String(url)
     w.calls.total++
-    if (url.includes('listings.json')) return new Response(JSON.stringify(w.listings))
-    if (url.includes('NEW_GRAD_USA.md')) return new Response(w.speedy)
+    const source = Object.keys(URLS).find(k => URLS[k] === url)
+    if (source) {
+      w.calls.sources[source] = (w.calls.sources[source] || 0) + 1
+      if (opts.headers) throw new Error('job boards must not receive headers / credentials')
+      if (w.sourceStatus[source]) return new Response('upstream error', { status: w.sourceStatus[source] })
+      const body = source === 'simplify' ? JSON.stringify(w.listings) : w[source]
+      return body == null ? new Response('404: Not Found', { status: 404 }) : new Response(body)
+    }
+    if (url.startsWith('https://raw.githubusercontent.com/')) {
+      throw new Error('unexpected source URL ' + url)
+    }
     if (url.includes('api.anthropic.com')) {
       w.calls.claude++
       const prompt = JSON.parse(opts.body).messages[0].content
@@ -78,6 +105,7 @@ function world({ listings = [], speedy = '', seen = { ids: {}, urls: {}, closed:
       w.calls.supabase++
       return new Response('[]')
     }
+    w.calls.other.push(url)   // no application URL is ever fetched
     return new Response('{}')
   }
   w.run = async (at) => {
@@ -504,5 +532,415 @@ test('extension endpoints still exist with the same auth', async () => {
   for (const [path, method] of [['/api/generate', 'POST'], ['/api/application', 'POST'], ['/api/summary', 'GET']]) {
     const res = await worker.fetch(new Request('https://w.example.com' + path, { method }), w.env)
     assert.equal(res.status, 401, path + ' requires the token')
+  }
+})
+
+// ══ Added AI / ML sources (speedyapply AI, ML Newgrad, Agnikulu) ══════
+
+// Fixture builders in each board's real layout (checked against the live files)
+const AI_HEAD = '## 2027 USA AI New Graduate Positions\n\n### FAANG+\n\n' +
+  '| Company | Position | Location | Salary | Posting | Age |\n|---|---|---|---|---|---|\n'
+const AI_OTHER_HEAD = '\n### Other\n\n| Company | Position | Location | Posting | Age |\n|---|---|---|---|---|\n'
+function aiRow({ company, title = 'Machine Learning Engineer', location = 'Seattle, WA', salary = '$180k/yr', url }) {
+  const apply = `<a href="${url}"><img src="https://i.imgur.com/JpkfjIq.png" alt="Apply" width="70"/></a>`
+  return `| <a href="https://www.${company.toLowerCase().replace(/\W/g, '')}.com"><strong>${company}</strong></a> | ${title} | ${location} | ` +
+    (salary === null ? '' : `${salary} | `) + `${apply} | 3d |\n`
+}
+const aiMd = (rows, other = []) => AI_HEAD + rows.map(aiRow).join('') +
+  AI_OTHER_HEAD + other.map(r => aiRow({ ...r, salary: null })).join('')
+
+const ML_HEAD = '# ML New Grad 2027\n\n**3** open roles\n\n## 🆕 New this week\n\n' +
+  '| Company | Role | Location | Posted | Apply |\n|---|---|---|---|---|\n'
+const mlRow = ({ company, title = 'AI Engineer', location = 'Austin, TX', url }) =>
+  `| **${company}** | ${title} | ${location} | **today** | [Apply](${url}) |\n`
+const mlMd = rows => ML_HEAD + rows.map(mlRow).join('') + '\n## How this list is built\n\nProse, not a table.\n'
+
+const agJson = rows => JSON.stringify(Object.fromEntries(rows.map(r => [r.url, {
+  title: r.title ?? 'Applied Scientist', company: r.company, location: r.location ?? 'New York, NY',
+  department: 'AI', category: 'frontier_ai', ats: 'greenhouse',
+  education_levels: r.education_levels ?? ['New Grad'], is_us: r.is_us ?? true,
+  posted_date: '2026-11-01', first_seen: '2026-11-01T00:00:00+00:00',
+  last_seen: '2026-11-16T00:00:00+00:00', is_closed: r.is_closed ?? false,
+}])))
+
+const aiJob = i => ({ company: `AiCo ${i}`, url: `https://jobs.aico${i}.com/ml/${i}` })
+const mlJob = i => ({ company: `MlCo ${i}`, url: `https://boards.greenhouse.io/mlco${i}/jobs/${i}` })
+const agJob = i => ({ company: `AgCo ${i}`, url: `https://jobs.ashbyhq.com/agco${i}/${i}` })
+
+// All five sources with history; seen-v1 already exists (normal mode, as in production)
+function fiveSources(n = 3) {
+  const ids = Array.from({ length: n }, (_, i) => i + 1)
+  return world({
+    listings: [listing(1)], speedy: '',
+    speedyAi: aiMd(ids.map(aiJob)), mlNewgrad: mlMd(ids.map(mlJob)), agnikulu: agJson(ids.map(agJob)),
+    seen: { ids: { 'sim-1': 1 }, urls: { 'https://jobs.example.com/1': 1 }, closed: {} },
+  })
+}
+const sourceSeed = w => JSON.parse(w.kv.get('source-seed-v1') || '{}')
+
+// ── Parsing ────────────────────────────────────────────────
+
+test('speedyapply AI markdown: salary and application URL, with and without a salary column', () => {
+  const md = aiMd([{ company: 'Google', title: 'Research Scientist - AI Safety', salary: '$196k/yr',
+    url: 'https://www.google.com/about/careers/applications/jobs/results/1128' }],
+  [{ company: 'Equinix', title: 'AI/Machine Learning Engineer', location: 'Dallas, TX +1',
+    url: 'https://equinix.wd1.myworkdayjobs.com/en-US/external/job/AI-ML_JR-1' }])
+  const { jobs, skipped } = parseSpeedyAiMarkdown(md)
+  assert.equal(skipped, 0)
+  assert.deepEqual(jobs, [
+    { company: 'Google', title: 'Research Scientist - AI Safety', location: 'Seattle, WA',
+      salary: '$196k/yr', url: 'https://www.google.com/about/careers/applications/jobs/results/1128' },
+    { company: 'Equinix', title: 'AI/Machine Learning Engineer', location: 'Dallas, TX +1',
+      salary: '', url: 'https://equinix.wd1.myworkdayjobs.com/en-US/external/job/AI-ML_JR-1' },
+  ])
+})
+
+test('ML Newgrad markdown: [Apply](url) links, linked company names, escaped pipes', () => {
+  const md = ML_HEAD +
+    '| **[Ravelin](http://www.ravelin.com/)** | Junior Data Scientist | Remote | **2d** | [Apply](https://ravelin.pinpointhq.com/en/postings/f1ee) |\n' +
+    '| **Selby Jennings** | Quantitative Researcher \\| NYC Hedge Fund | New York, NY | **4d** | [Apply](https://www.selbyjennings.com/en-us/job/qr-590576) |\n' +
+    '\n## 🧪 AI Labs\n\n| Company | Role | Location | Posted | Apply |\n|---|---|---|---|---|\n' +
+    '| **OpenAI** | Member of Technical Staff, Applied AI | San Francisco, CA | **5d** | [Apply](<https://jobs.ashbyhq.com/openai/abc>) |\n'
+  const { jobs, skipped } = parseMlNewgradMarkdown(md)
+  assert.equal(skipped, 0)
+  assert.deepEqual(jobs.map(j => [j.company, j.title, j.location, j.url]), [
+    ['Ravelin', 'Junior Data Scientist', 'Remote', 'https://ravelin.pinpointhq.com/en/postings/f1ee'],
+    ['Selby Jennings', 'Quantitative Researcher | NYC Hedge Fund', 'New York, NY', 'https://www.selbyjennings.com/en-us/job/qr-590576'],
+    ['OpenAI', 'Member of Technical Staff, Applied AI', 'San Francisco, CA', 'https://jobs.ashbyhq.com/openai/abc'],
+  ])
+})
+
+test('Agnikulu JSON: open US jobs only; closed, non-US and PhD-only records excluded', () => {
+  const { jobs, skipped } = parseAgnikuluJson(agJson([
+    { company: 'Adobe', title: '2027 University Graduate - Machine Learning Engineer',
+      location: 'San Jose', url: 'https://adobe.wd5.myworkdayjobs.com/job/MLE_R172085' },
+    { company: 'Block', title: 'Data Scientist', is_closed: true, url: 'https://block.xyz/careers/jobs/52' },
+    { company: 'Wayve', title: 'ML Engineer', is_us: false, url: 'https://wayve.ai/jobs/1' },
+    { company: 'DeepLab', title: 'Research Scientist', education_levels: ['PhD'], url: 'https://deeplab.example.com/1' },
+  ]))
+  assert.equal(skipped, 0)
+  assert.deepEqual(jobs, [{
+    company: 'Adobe', title: '2027 University Graduate - Machine Learning Engineer', location: 'San Jose',
+    salary: '', url: 'https://adobe.wd5.myworkdayjobs.com/job/MLE_R172085', category: 'frontier_ai', degrees: 'New Grad',
+  }])
+})
+
+test('unsafe or malformed application URLs are skipped and counted', () => {
+  for (const bad of ['http://jobs.example.com/1', 'javascript:alert(1)', 'https://go.vansh.nyc/1A4',
+    'https://bit.ly/x', 'https://user:pw@jobs.example.com/1', 'https://localhost/x', 'https://10.0.0.1/x',
+    'https://jobs.example.com:8443/x', 'https://jobs.example.com/a b', 'https://x.example.com/"><script>',
+    '', 'not a url', null, 42]) {
+    assert.equal(safeApplyUrl(bad), null, `rejects ${bad}`)
+  }
+  assert.equal(safeApplyUrl(' https://jobs.lever.co/acme/123?lever-origin=x '), 'https://jobs.lever.co/acme/123?lever-origin=x')
+
+  const ml = parseMlNewgradMarkdown(mlMd([
+    { company: 'Microsoft', title: 'Applied Sciences', url: 'https://go.vansh.nyc/1A4' },
+    { company: 'Evil', title: 'AI Engineer', url: 'javascript:alert(1)' },
+    { company: 'Good', title: 'AI Engineer', url: 'https://jobs.good.com/1' },
+  ]) + '| **NoLink** | ML Engineer | Remote | **1d** | Closed |\n')
+  assert.deepEqual(ml.jobs.map(j => j.company), ['Good'])
+  assert.equal(ml.skipped, 2, 'shortener + javascript: (the last row is outside any table)')
+
+  const ai = parseSpeedyAiMarkdown(aiMd([{ company: 'Plain', url: 'http://plain.example.com/1' },
+    { company: 'Ok', url: 'https://ok.example.com/1' }]))
+  assert.deepEqual(ai.jobs.map(j => j.company), ['Ok'])
+  assert.equal(ai.skipped, 1)
+
+  const ag = parseAgnikuluJson(JSON.stringify({
+    'http://block.xyz/careers/jobs/5214784008': { title: 'ML Engineer', company: 'Block', is_us: true, is_closed: false },
+    'https://ok.example.com/2': { title: 'ML Engineer', company: 'Ok', is_us: true, is_closed: false },
+    'https://bad.example.com/3': { title: 42, company: 'Bad' },
+  }))
+  assert.deepEqual(ag.jobs.map(j => j.company), ['Ok'])
+  assert.equal(ag.skipped, 2)
+})
+
+test('malformed documents throw; valid empty documents do not', () => {
+  assert.throws(() => parseSpeedyAiMarkdown('<html>rate limited</html>'), /unrecognized format/)
+  assert.throws(() => parseMlNewgradMarkdown('# ML New Grad 2027\n\nNo tables today.'), /unrecognized format/)
+  assert.throws(() => parseAgnikuluJson('{"truncated": '), /invalid JSON/)
+  assert.throws(() => parseAgnikuluJson('"just a string"'), /unrecognized format/)
+  assert.deepEqual(parseSpeedyAiMarkdown(aiMd([])), { jobs: [], skipped: 0 })
+  assert.deepEqual(parseMlNewgradMarkdown(mlMd([])), { jobs: [], skipped: 0 })
+  assert.deepEqual(parseAgnikuluJson('{}'), { jobs: [], skipped: 0 })
+})
+
+// ── Title matching ─────────────────────────────────────────
+
+test('AI/ML titles are recognized; senior, intern, PhD-only and non-technical roles are not', () => {
+  for (const t of ['AI Engineer', 'Applied AI Engineer', 'Machine Learning Engineer', 'ML Engineer',
+    'LLM Engineer', 'Generative AI Engineer', 'Applied Scientist', 'Applied Scientist II', 'NLP Engineer',
+    'AI Software Engineer', 'Software Engineer — Machine Learning', 'Member of Technical Staff',
+    'Research Scientist - AI Safety', 'Applied Sciences', 'Computer Vision Researcher', 'GenAI Specialist',
+    'Software Engineer, New Grad (BS/MS/PhD)', 'Software Engineer III']) {
+    assert.equal(matchesKeywords(t), true, `admits "${t}"`)
+  }
+  for (const t of ['Senior Machine Learning Engineer', 'Staff AI Engineer', 'Principal Applied Scientist',
+    'Director of AI', 'Machine Learning Intern', 'ML Engineer Internship', 'PhD Research Scientist - Generative AI',
+    'Machine Learning Engineer Graduate - 2027 Start - PhD', 'Postdoctoral Researcher, AI',
+    'Head of AI Platform', 'VP, Machine Learning', 'ML Engineer (5+ years)', 'AI Trainer - Writing',
+    'AI Sales Representative', 'Senior Member of Technical Staff', 'Equity Research Associate', 'Account Executive']) {
+    assert.equal(matchesKeywords(t), false, `rejects "${t}"`)
+  }
+})
+
+// ── Silent baseline per source (source-seed-v1) ────────────
+
+test('first successful crawl of each new source: jobs remembered, nothing scored or sent', async () => {
+  const w = fiveSources(3)
+  const log = await w.run(T0)
+  assert.equal(log.mode, 'normal')
+  assert.equal(log.queued, 0)
+  assert.equal(log.seeded, 9)
+  assert.equal(w.calls.claude, 0, 'historical jobs are not scored')
+  assert.equal(w.calls.telegram, 0, 'no Telegram message at all')
+  assert.deepEqual(Object.keys(w.pending().jobs), [])
+  assert.deepEqual(Object.keys(sourceSeed(w)).sort(), ['agnikulu', 'ml-newgrad', 'speedyapply-ai'])
+  for (const s of ['speedyapply-ai', 'ml-newgrad', 'agnikulu']) assert.equal(log.sources[s].status, 'seeded')
+  const seen = JSON.parse(w.kv.get('seen-v1'))
+  assert.equal(seen.urls['https://jobs.aico1.com/ml/1'], 1)
+  assert.deepEqual(Object.keys(seen).sort(), ['closed', 'ids', 'urls'], 'seen-v1 keeps its shape')
+  assert.deepEqual(w.calls.other, [], 'no application URL was fetched')
+
+  const again = await w.run(T0 + HOUR / 2)
+  assert.equal(again.queued, 0)
+  assert.equal(w.calls.claude, 0)
+})
+
+test('after the baseline, newly added jobs from each source are scored and sent', async () => {
+  const w = fiveSources(3)
+  await w.run(T0)
+  w.speedyAi = aiMd([1, 2, 3, 4].map(aiJob).map((j, i) => i === 3 ? { ...j, salary: '$201k/yr' } : j))
+  w.mlNewgrad = mlMd([1, 2, 3, 4].map(mlJob))
+  w.agnikulu = agJson([1, 2, 3, 4].map(agJob))
+  const log = await w.run(T0 + HOUR / 2)
+  assert.equal(log.queued, 3)
+  assert.equal(log.scored, 3)
+  assert.equal(log.notified, 3)
+  assert.deepEqual(matches(w).map(m => m.split('\n')[1]).sort(), [
+    '<b>85/100</b> — AgCo 4 — Applied Scientist',
+    '<b>85/100</b> — AiCo 4 — Machine Learning Engineer',
+    '<b>85/100</b> — MlCo 4 — AI Engineer',
+  ])
+  assert.ok(matches(w).some(m => m.includes('Seattle, WA｜$201k/yr')), 'salary kept in the message')
+  assert.ok(w.prompts.some(p => p.includes('Degrees: New Grad')), 'Agnikulu education levels reach the prompt')
+  assert.equal(log.sources['ml-newgrad'].added, 1)
+})
+
+test('existing Simplify and speedyapply SWE sources work unchanged next to the new ones', async () => {
+  const w = fiveSources(2)
+  w.listings = [listing(1), listing(2)]
+  w.speedy = '| Speedy Co | Software Engineer | Austin, TX | $150k | <a href="https://speedy.example.com/1">Apply</a> | 1d |\n'
+  const log = await w.run(T0)
+  assert.equal(log.simplify, 2)
+  assert.equal(log.speedy, 1)
+  assert.equal(log.queued, 2, 'Simplify + speedyapply SWE new jobs, none from the baselined sources')
+  assert.equal(matches(w).length, 2)
+  assert.equal(Object.keys(w.pending().jobs).length, 0, 'queue drained')
+})
+
+test('the same job URL on several sources is queued and scored once', async () => {
+  const w = fiveSources(1)
+  await w.run(T0)
+  const shared = { company: 'Shared AI', url: 'https://jobs.lever.co/shared/1' }
+  w.speedyAi = aiMd([aiJob(1), { ...shared, title: 'ML Engineer' }])
+  w.mlNewgrad = mlMd([mlJob(1), { ...shared, title: 'ML Engineer', url: shared.url + '?utm_source=mlnewgrad' }])
+  w.agnikulu = agJson([agJob(1), { ...shared, title: 'ML Engineer', url: shared.url + '/' }])
+  const log = await w.run(T0 + HOUR / 2)
+  assert.equal(log.queued, 1)
+  assert.equal(w.calls.claude, 1)
+  assert.equal(matches(w).length, 1)
+  await w.run(T0 + HOUR)
+  assert.equal(w.calls.claude, 1, 'not queued again on the next crawl')
+})
+
+test('one role under different URLs on different sources: one Telegram message', async () => {
+  const w = fiveSources(1)
+  await w.run(T0)
+  const role = { company: 'Acme AI', title: 'Machine Learning Engineer', location: 'Austin, TX' }
+  w.speedyAi = aiMd([aiJob(1), { ...role, url: 'https://acme.wd1.myworkdayjobs.com/job/MLE_R1' }])
+  w.mlNewgrad = mlMd([mlJob(1), { ...role, url: 'https://jobs.ashbyhq.com/acme/mle' }])
+  const log = await w.run(T0 + HOUR / 2)
+  assert.equal(log.queued, 1)
+  assert.equal(log.duplicates, 1)
+  assert.equal(matches(w).length, 1)
+  w.agnikulu = agJson([agJob(1), { ...role, url: 'https://boards.greenhouse.io/acme/jobs/9' }])
+  await w.run(T0 + HOUR)
+  assert.equal(matches(w).length, 1, 'still one message when it shows up again later')
+})
+
+test('a source returning HTTP 500 does not block the others and is baselined once it recovers', async () => {
+  const w = fiveSources(2)
+  w.sourceStatus.mlNewgrad = 500
+  w.listings = [listing(1), listing(2)]
+  const log = await w.run(T0)
+  assert.equal(log.sources['ml-newgrad'].status, 'failed')
+  assert.equal(log.sources['speedyapply-ai'].status, 'seeded')
+  assert.equal(log.sources.agnikulu.status, 'seeded')
+  assert.equal(log.queued, 1, 'Simplify still works')
+  assert.ok(!('ml-newgrad' in sourceSeed(w)), 'failed source is not marked baselined')
+
+  delete w.sourceStatus.mlNewgrad
+  const log2 = await w.run(T0 + HOUR / 2)
+  assert.equal(log2.sources['ml-newgrad'].status, 'seeded')
+  assert.equal(log2.queued, 0, 'its history is still not treated as new')
+  assert.equal(w.calls.claude, 1)
+})
+
+test('malformed data never marks a source as baselined', async () => {
+  const w = fiveSources(2)
+  w.speedyAi = '<html><body>Rate limit exceeded</body></html>'
+  w.mlNewgrad = mlMd([]).replace(/\| Company \| Role[^\n]*\n/, '')   // header gone: format changed
+  w.agnikulu = agJson([1, 2].map(agJob)).slice(0, 80)               // truncated JSON
+  const log = await w.run(T0)
+  for (const s of ['speedyapply-ai', 'ml-newgrad', 'agnikulu']) {
+    assert.equal(log.sources[s].status, 'failed', s)
+  }
+  assert.equal(w.kv.has('source-seed-v1'), false)
+
+  // a table whose every row is unusable is malformed too, not "empty"
+  w.speedyAi = aiMd([1, 2].map(i => ({ ...aiJob(i), url: 'https://go.vansh.nyc/' + i })))
+  const log2 = await w.run(T0 + HOUR / 2)
+  assert.equal(log2.sources['speedyapply-ai'].status, 'failed')
+  assert.equal(w.kv.has('source-seed-v1'), false)
+
+  // once the data is valid again: silent baseline, not a flood
+  w.speedyAi = aiMd([1, 2].map(aiJob))
+  w.mlNewgrad = mlMd([1, 2].map(mlJob))
+  w.agnikulu = agJson([1, 2].map(agJob))
+  const log3 = await w.run(T0 + HOUR)
+  assert.equal(log3.seeded, 6)
+  assert.equal(log3.queued, 0)
+  assert.equal(w.calls.claude, 0)
+})
+
+test('empty but valid datasets are "empty", not failures, and do not baseline the source', async () => {
+  const w = fiveSources(0)
+  const log = await w.run(T0)
+  for (const s of ['speedyapply-ai', 'ml-newgrad', 'agnikulu']) {
+    assert.equal(log.sources[s].status, 'empty', s)
+    assert.equal(log.sources[s].error, undefined)
+  }
+  assert.equal(w.kv.has('source-seed-v1'), false)
+  // jobs appear later: that first non-empty crawl is the silent baseline
+  w.speedyAi = aiMd([1, 2].map(aiJob))
+  const log2 = await w.run(T0 + HOUR / 2)
+  assert.equal(log2.sources['speedyapply-ai'].status, 'seeded')
+  assert.equal(log2.queued, 0)
+  // a baselined source that becomes empty stays baselined and is fine
+  w.speedyAi = aiMd([])
+  const log3 = await w.run(T0 + HOUR)
+  assert.equal(log3.sources['speedyapply-ai'].status, 'ok')
+  assert.ok('speedyapply-ai' in sourceSeed(w))
+})
+
+// ── KV failures never cause a flood ─────────────────────────
+
+test('source-seed-v1 unreadable: the new sources are skipped, nothing queued or marked', async () => {
+  const w = fiveSources(3)
+  w.failKvGet = 'source-seed-v1'
+  const log = await w.run(T0)
+  for (const s of ['speedyapply-ai', 'ml-newgrad', 'agnikulu']) assert.equal(log.sources[s].status, 'skipped')
+  assert.equal(log.queued, 0)
+  assert.equal(w.calls.sources.speedyAi, undefined, 'not even fetched')
+  assert.equal(JSON.parse(w.kv.get('seen-v1')).urls['https://jobs.aico1.com/ml/1'], undefined)
+  w.failKvGet = null
+  const log2 = await w.run(T0 + HOUR / 2)
+  assert.equal(log2.seeded, 9)
+  assert.equal(log2.queued, 0)
+})
+
+test('seen-v1 write fails during a baseline: source not marked, re-baselined silently next run', async () => {
+  const w = fiveSources(3)
+  w.failKvPut = 'seen-v1'
+  await assert.rejects(w.run(T0))
+  assert.equal(w.kv.has('source-seed-v1'), false, 'never marked before its jobs are in seen-v1')
+  w.failKvPut = null
+  const log = await w.run(T0 + HOUR / 2)
+  assert.equal(log.seeded, 9)
+  assert.equal(log.queued, 0)
+  assert.equal(w.calls.claude, 0)
+  assert.equal(w.calls.telegram, 0)
+})
+
+test('source-seed-v1 write fails: the run continues and the next run re-baselines silently', async () => {
+  const w = fiveSources(3)
+  w.listings = [listing(1), listing(2)]
+  w.failKvPut = 'source-seed-v1'
+  const log = await w.run(T0)
+  assert.equal(log.queued, 1, 'Simplify job still processed')
+  assert.equal(matches(w).length, 1)
+  w.failKvPut = null
+  const log2 = await w.run(T0 + HOUR / 2)
+  assert.equal(log2.queued, 0)
+  assert.equal(w.calls.claude, 1, 'no historical job scored')
+  assert.deepEqual(Object.keys(sourceSeed(w)).sort(), ['agnikulu', 'ml-newgrad', 'speedyapply-ai'])
+})
+
+test('corrupt source-seed-v1: sources re-baselined silently', async () => {
+  const w = fiveSources(2)
+  w.kv.set('source-seed-v1', '{not json')
+  const log = await w.run(T0)
+  assert.equal(log.seeded, 6)
+  assert.equal(log.queued, 0)
+  assert.equal(w.calls.claude, 0)
+})
+
+test('baselined source that suddenly reports a wall of unseen jobs is absorbed, not sent', async () => {
+  const w = fiveSources(60)
+  await w.run(T0)
+  // same 60 jobs, every URL changed (e.g. the board switched link format)
+  w.agnikulu = agJson(Array.from({ length: 60 }, (_, i) => ({ ...agJob(i + 1), url: `https://new.example.com/${i}` })))
+  const log = await w.run(T0 + HOUR / 2)
+  assert.equal(log.sources.agnikulu.status, 'reseeded')
+  assert.equal(log.queued, 0)
+  assert.equal(w.calls.claude, 0)
+  // a normal trickle afterwards still flows through
+  w.agnikulu = agJson([...Array.from({ length: 60 }, (_, i) => ({ ...agJob(i + 1), url: `https://new.example.com/${i}` })), agJob(99)])
+  const log2 = await w.run(T0 + HOUR)
+  assert.equal(log2.queued, 1)
+})
+
+test('first run ever (no seen-v1) also baselines the new sources silently', async () => {
+  const w = fiveSources(2)
+  w.kv.delete('seen-v1')
+  const log = await w.run(T0)
+  assert.equal(log.mode, 'seed')
+  assert.equal(w.calls.claude, 0)
+  assert.equal(matches(w).length, 0)
+  assert.deepEqual(Object.keys(sourceSeed(w)).sort(), ['agnikulu', 'ml-newgrad', 'speedyapply-ai'])
+  const log2 = await w.run(T0 + HOUR / 2)
+  assert.equal(log2.queued, 0)
+})
+
+test('five sources stay within the subrequest budget with a large backlog', async () => {
+  const w = fiveSources(3)
+  await w.run(T0)
+  w.listings = Array.from({ length: 200 }, (_, i) => listing(i + 10))
+  w.score = () => ({ score: 95, reason: 'great' })
+  const before = w.calls.total
+  await w.run(T0 + HOUR / 2)
+  const used = w.calls.total - before
+  assert.ok(used <= 48, `used ${used} subrequests`)
+  assert.equal(matches(w).length, 10, 'notify cap respected; rest wait')
+})
+
+test('/api/status shows which added sources are baselined, without secrets', async () => {
+  const w = fiveSources(1)
+  w.env.WORKER_TOKEN = 'tok'
+  await w.run(T0)
+  const res = await worker.fetch(new Request('https://w.example.com/api/status',
+    { headers: { Authorization: 'Bearer tok' } }), w.env)
+  const data = await res.json()
+  assert.deepEqual(Object.keys(data.sourceSeed).sort(), ['agnikulu', 'ml-newgrad', 'speedyapply-ai'])
+  assert.ok(!JSON.stringify(data).includes('sb-key'))
+})
+
+test('every named export is a function (the Workers runtime rejects other exports at startup)', async () => {
+  const mod = await import('../src/index.js')
+  for (const [name, value] of Object.entries(mod)) {
+    if (name === 'default') continue
+    assert.equal(typeof value, 'function', `export ${name} must be a function`)
   }
 })
